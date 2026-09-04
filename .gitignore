@@ -1,0 +1,48 @@
+# Build directories
+/build/
+/cmake-build-*/
+/out/
+/logs/
+/dist/
+/installer/
+/.runtime/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Pico / embedded build outputs
+*.bin
+*.dis
+*.elf
+*.elf.map
+*.hex
+*.uf2
+*.map
+*.o
+*.obj
+*.a
+*.d
+
+# Logs and temporary captures
+*.log
+*.tmp
+*.bak
+*.orig
+
+# Editor and OS noise
+/.vscode/
+/.idea/
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+# Python/tool caches
+__pycache__/
+.pytest_cache/
+.cache/

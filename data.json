@@ -1,0 +1,211 @@
+{
+  "note": "整理自 Serial Monitor 的 CAPTURE 输出。数值为 Nintendo Switch Pro USB HID 0x30 report 的原始值；sw_btn = report[3] | report[4]<<8 | report[5]<<16。空闲时 sw_btn 通常为 0x008000。",
+  "device": {
+    "vid": "0x057E",
+    "pid": "0x2009",
+    "report_id": "0x30",
+    "active_hid_instance": 2,
+    "report_length": 64
+  },
+  "layout": {
+    "button_mask_neutral": "0x008000",
+    "button_bytes": {
+      "byte0_report_index": 3,
+      "byte1_report_index": 4,
+      "byte2_report_index": 5
+    },
+    "left_stick": {
+      "bytes": [6, 7, 8],
+      "x_formula": "report[6] | ((report[7] & 0x0F) << 8)",
+      "y_formula": "(report[7] >> 4) | (report[8] << 4)"
+    },
+    "right_stick": {
+      "bytes": [9, 10, 11],
+      "x_formula": "report[9] | ((report[10] & 0x0F) << 8)",
+      "y_formula": "(report[10] >> 4) | (report[11] << 4)"
+    },
+    "approx_neutral": {
+      "left": { "x": 2054, "y": 2003 },
+      "right": { "x": 2014, "y": 2041 }
+    }
+  },
+  "buttons": {
+    "Y": {
+      "pressed_sw_btn": "0x008001",
+      "delta_from_neutral": "0x000001",
+      "report_index": 3,
+      "bit": "0x01"
+    },
+    "X": {
+      "pressed_sw_btn": "0x008002",
+      "delta_from_neutral": "0x000002",
+      "report_index": 3,
+      "bit": "0x02"
+    },
+    "B": {
+      "pressed_sw_btn": "0x008004",
+      "delta_from_neutral": "0x000004",
+      "report_index": 3,
+      "bit": "0x04"
+    },
+    "A": {
+      "pressed_sw_btn": "0x008008",
+      "delta_from_neutral": "0x000008",
+      "report_index": 3,
+      "bit": "0x08"
+    },
+    "RB": {
+      "pressed_sw_btn": "0x008040",
+      "delta_from_neutral": "0x000040",
+      "report_index": 3,
+      "bit": "0x40",
+      "current_mapping": "mouse_left"
+    },
+    "RT": {
+      "pressed_sw_btn": "0x008080",
+      "delta_from_neutral": "0x000080",
+      "report_index": 3,
+      "bit": "0x80"
+    },
+    "menu": {
+      "pressed_sw_btn": "0x008100",
+      "delta_from_neutral": "0x000100",
+      "report_index": 4,
+      "bit": "0x01"
+    },
+    "option": {
+      "pressed_sw_btn": "0x008200",
+      "delta_from_neutral": "0x000200",
+      "report_index": 4,
+      "bit": "0x02"
+    },
+    "Rstick_click": {
+      "aliases": ["R3"],
+      "pressed_sw_btn": "0x008400",
+      "delta_from_neutral": "0x000400",
+      "report_index": 4,
+      "bit": "0x04",
+      "current_mapping": "tap alternates keyboard 1/2, hold keyboard X"
+    },
+    "Lstick_click": {
+      "aliases": ["L3"],
+      "pressed_sw_btn": "0x008800",
+      "delta_from_neutral": "0x000800",
+      "report_index": 4,
+      "bit": "0x08",
+      "current_mapping": "keyboard_left_shift_or_profile2_keyboard_q"
+    },
+    "snapshot": {
+      "pressed_sw_btn": "0x00A000",
+      "delta_from_neutral": "0x002000",
+      "report_index": 4,
+      "bit": "0x20",
+      "current_mapping": "short_press_macro_left_alt_down_30ms_mouse_right_down_10ms_mouse_right_up_30ms_left_alt_up"
+    },
+    "Dpad_down": {
+      "pressed_sw_btn": "0x018000",
+      "delta_from_neutral": "0x010000",
+      "report_index": 5,
+      "bit": "0x01",
+      "current_mapping": "profile_specific; LT+RT+Dpad_down wheel_down_10hz"
+    },
+    "Dpad_up": {
+      "pressed_sw_btn": "0x028000",
+      "delta_from_neutral": "0x020000",
+      "report_index": 5,
+      "bit": "0x02",
+      "current_mapping": "profile_specific; LT+RT+Dpad_up wheel_up_10hz"
+    },
+    "Dpad_right": {
+      "pressed_sw_btn": "0x048000",
+      "delta_from_neutral": "0x040000",
+      "report_index": 5,
+      "bit": "0x04"
+    },
+    "Dpad_left": {
+      "pressed_sw_btn": "0x088000",
+      "delta_from_neutral": "0x080000",
+      "report_index": 5,
+      "bit": "0x08"
+    },
+    "LB": {
+      "pressed_sw_btn": "0x408000",
+      "delta_from_neutral": "0x400000",
+      "report_index": 5,
+      "bit": "0x40",
+      "current_mapping": "mouse_right"
+    },
+    "LT": {
+      "pressed_sw_btn": "0x808000",
+      "delta_from_neutral": "0x800000",
+      "report_index": 5,
+      "bit": "0x80"
+    }
+  },
+  "sticks": {
+    "left_stick": {
+      "up": {
+        "source_label": "Lsitck_up",
+        "mapped_key": "W",
+        "x": { "min": 2201, "median": 2211, "max": 2219 },
+        "y": { "min": 3424, "median": 4088, "max": 4089 }
+      },
+      "down": {
+        "source_label": "Lstick_down",
+        "mapped_key": "S",
+        "x": { "min": 1935, "median": 1940.5, "max": 1964 },
+        "y": { "min": 2, "median": 3, "max": 171 }
+      },
+      "left": {
+        "source_label": "Lstick_left",
+        "mapped_key": "A",
+        "x": { "min": 15, "median": 15, "max": 15 },
+        "y": { "min": 2290, "median": 2291, "max": 2293 }
+      },
+      "right": {
+        "source_label": "Lsitck_right",
+        "mapped_key": "D",
+        "x": { "min": 4094, "median": 4094, "max": 4094 },
+        "y": { "min": 1995, "median": 2006, "max": 2014 }
+      }
+    },
+    "right_stick": {
+      "up": {
+        "source_label": "Rstick_up",
+        "mouse_axis": "y_negative",
+        "x": { "min": 1682, "median": 1697, "max": 1751 },
+        "y": { "min": 4061, "median": 4064, "max": 4073 }
+      },
+      "down": {
+        "source_label": "Rstick_down",
+        "mouse_axis": "y_positive",
+        "x": { "min": 2514, "median": 2579.5, "max": 2603 },
+        "y": { "min": 54, "median": 71, "max": 77 }
+      },
+      "left": {
+        "source_label": "Rstick_left",
+        "mouse_axis": "x_negative",
+        "x": { "min": 19, "median": 20, "max": 20 },
+        "y": { "min": 1764, "median": 1766, "max": 1771 }
+      },
+      "right": {
+        "source_label": "Rstick_right",
+        "mouse_axis": "x_positive",
+        "x": { "min": 3725, "median": 4048, "max": 4052 },
+        "y": { "min": 2271, "median": 2473, "max": 2482 }
+      }
+    }
+  },
+  "capture_quality": {
+    "LB": "20 samples were present; first 8 showed pressed value 0x408000, later samples included release/noise.",
+    "RB": "Some samples included release; dominant pressed value is 0x008040.",
+    "LT": "Some samples included release; dominant pressed value is 0x808000.",
+    "RT": "Some samples included release; dominant pressed value is 0x008080.",
+    "menu": "Some samples included release; dominant pressed value is 0x008100.",
+    "option": "Some samples included release; dominant pressed value is 0x008200.",
+    "Rstick_click": "Captured in additional source; pressed samples used 0x008400, with neutral/release samples mixed in.",
+    "Lstick_click": "Captured in additional source; first 6 samples used pressed value 0x008800, later samples were neutral/release.",
+    "snapshot": "One sample included release; dominant pressed value is 0x00A000."
+  },
+  "not_captured_in_source": ["Home"]
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pico Controller Mapping"
+  short_description: "Edit this Pico mapping firmware."
+  default_prompt: "Update this PicoController2MNK mapping and build the UF2 outputs."

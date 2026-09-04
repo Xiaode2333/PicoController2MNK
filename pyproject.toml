@@ -1,0 +1,19 @@
+[project]
+name = "picocontroller2mnk"
+version = "0.1.2"
+description = "RP2040 USB controller-to-keyboard/mouse mapper with persistent profiles and a desktop configurator."
+authors = [
+    {name = "Xiaode2333",email = "Xiaode2333@users.noreply.github.com"}
+]
+requires-python = ">=3.12,<4.0"
+dependencies = [
+    "pyserial (>=3.5,<4.0)",
+    "pynput (>=1.7.8,<2.0)"
+]
+
+[tool.poetry]
+package-mode = false
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
