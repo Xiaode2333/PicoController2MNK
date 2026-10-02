@@ -87,7 +87,13 @@ is never flashed.
 
 - **Bindings tab**: choose a Profile to see its complete direct bindings,
   stick/mouse rules, active combos, and all eight macros. Double-click any
-  Tap/Hold/Double cell, including stick-direction rows, to replace its action.
+  Tap/While pressed/Hold/Double cell, including stick-direction rows, to replace
+  its action. **While pressed** starts immediately; **Hold** starts after the
+  global hold threshold or a custom delay of 2-65535 ms. Both end on release.
+  These are alternative modes for one binding: editing either column opens a
+  **Trigger mode** selector, and choosing one replaces the other for that input.
+  Hold cells show their effective activation delay. Existing configs retain
+  their original mode and delay.
   The lower panes provide complete combo add/edit/clear controls and a stick
   rule editor; Profile 2's RB speeds and outer-ring acceleration are editable.
 - **Macros tab**: all eight slots can be renamed and assigned a trigger. Add,

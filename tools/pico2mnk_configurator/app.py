@@ -33,6 +33,11 @@ OUTPUT_STATE_LABELS = (
     "Disabled — release and stop output",
     "Enabled — send mapped keyboard/mouse",
 )
+HOLD_TIMING_LABELS = (
+    "While pressed — activate immediately",
+    "Hold — use global hold threshold",
+    "Hold — use custom delay",
+)
 WINDOWS_APP_USER_MODEL_ID = "Xiaode2333.PicoController2MNK.Configurator"
 
 
@@ -65,6 +70,17 @@ def format_action_for_config(config: cm.ConfigPayload, action: cm.Action) -> str
     if action.type in (cm.ACTION_WHEEL_UP_COMBO, cm.ACTION_WHEEL_DOWN_COMBO):
         return f"{text} ({config.settings.wheel_combo_hz} Hz)"
     return text
+
+
+def format_hold_binding(config: cm.ConfigPayload, action: cm.Action) -> tuple[str, str]:
+    """Split the shared firmware slot into its two mutually exclusive UI modes."""
+    if action.type == cm.ACTION_NONE:
+        return "None", "None"
+    text = format_action_for_config(config, action)
+    if action.duration_ms == 1:
+        return text, "None"
+    delay = action.duration_ms or config.settings.hold_threshold_ms
+    return "None", f"After {delay} ms: {text}"
 
 
 def build_profile_combo_rows(
@@ -151,8 +167,11 @@ def build_profile_macro_rows(
     for source, gestures in enumerate(config.bindings[profile]):
         for gesture, action in enumerate(gestures):
             if action.type == cm.ACTION_MACRO and 0 <= action.param1 < cm.MACRO_MAX:
+                gesture_name = cm.GESTURE_NAMES[gesture]
+                if gesture == cm.GESTURE_HOLD and action.duration_ms == 1:
+                    gesture_name = "While pressed"
                 bindings[action.param1].append(
-                    f"{cm.SOURCE_NAMES[source]} ({cm.GESTURE_NAMES[gesture]})"
+                    f"{cm.SOURCE_NAMES[source]} ({gesture_name})"
                 )
     for combo in config.combos:
         if (
@@ -176,12 +195,13 @@ def build_profile_macro_rows(
 
 class ActionDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, title: str, initial: cm.Action,
-                 macro_names: list[str]):
+                 macro_names: list[str], *, edit_hold_timing: bool = False):
         super().__init__(parent)
         self.title(title)
         self.resizable(False, False)
         self.result: Optional[cm.Action] = None
         self.macro_names = macro_names
+        self.edit_hold_timing = edit_hold_timing
 
         self.type_var = tk.StringVar(value=str(initial.type))
         self.param1_var = tk.IntVar(value=initial.param1)
@@ -206,6 +226,36 @@ class ActionDialog(tk.Toplevel):
         self.dynamic = ttk.Frame(frame)
         self.dynamic.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=8)
 
+        timing_index = 0 if initial.duration_ms == 1 else (1 if initial.duration_ms == 0 else 2)
+        self.hold_timing_var = tk.StringVar(value=HOLD_TIMING_LABELS[timing_index])
+        self.hold_delay_var = tk.StringVar(
+            value=str(initial.duration_ms if initial.duration_ms > 1 else 200)
+        )
+        if self.edit_hold_timing:
+            timing_frame = ttk.LabelFrame(frame, text="Activation", padding=8)
+            timing_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            ttk.Label(timing_frame, text="Trigger mode").grid(row=0, column=0, sticky="w")
+            timing_box = ttk.Combobox(
+                timing_frame, textvariable=self.hold_timing_var, state="readonly",
+                values=HOLD_TIMING_LABELS, width=38,
+            )
+            timing_box.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+            timing_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh_hold_timing())
+            ttk.Label(timing_frame, text="Custom delay (ms)").grid(row=1, column=0, sticky="w")
+            self.hold_delay_entry = ttk.Entry(
+                timing_frame, textvariable=self.hold_delay_var, width=12
+            )
+            self.hold_delay_entry.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=4)
+            ttk.Label(
+                timing_frame,
+                text=(
+                    "While pressed starts immediately. Hold starts after the threshold. "
+                    "Both end on release. These modes share one slot; choosing one "
+                    "replaces the other for this input. Custom delay: 2-65535 ms."
+                ), wraplength=420,
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            self._refresh_hold_timing()
+
         self.key_var = tk.IntVar(value=initial.param1 if initial.type == cm.ACTION_KEY else 0)
         self.mod_var = tk.IntVar(
             value=initial.param1 if initial.type == cm.ACTION_MODIFIER_KEY else 0
@@ -227,7 +277,7 @@ class ActionDialog(tk.Toplevel):
         self._refresh()
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=0, columnspan=2, sticky="e", pady=4)
+        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=4)
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(buttons, text="OK", command=self._ok).pack(side="right", padx=4)
 
@@ -273,6 +323,10 @@ class ActionDialog(tk.Toplevel):
 
     def _current_type(self) -> int:
         return int(str(self.type_var.get()).split()[0])
+
+    def _refresh_hold_timing(self) -> None:
+        custom = self.hold_timing_var.get() == HOLD_TIMING_LABELS[2]
+        self.hold_delay_entry.configure(state="normal" if custom else "disabled")
 
     def _refresh(self) -> None:
         self._clear_dynamic()
@@ -334,6 +388,23 @@ class ActionDialog(tk.Toplevel):
 
     def _ok(self) -> None:
         action_type = self._current_type()
+        duration_ms = 0
+        if self.edit_hold_timing and action_type != cm.ACTION_NONE:
+            mode = self.hold_timing_var.get()
+            if mode == HOLD_TIMING_LABELS[0]:
+                duration_ms = 1
+            elif mode == HOLD_TIMING_LABELS[2]:
+                try:
+                    duration_ms = int(self.hold_delay_var.get())
+                    if not 2 <= duration_ms <= 0xFFFF:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror(
+                        "Invalid hold delay",
+                        "Custom hold delay must be a whole number from 2 to 65535 ms.",
+                        parent=self,
+                    )
+                    return
         if action_type == cm.ACTION_NONE:
             self.result = cm.Action(type=cm.ACTION_NONE)
         elif action_type == cm.ACTION_KEY:
@@ -368,6 +439,8 @@ class ActionDialog(tk.Toplevel):
                 param1=self.macro_index.get(),
                 trigger_mode=self.trigger_var.get(),
             )
+        if self.edit_hold_timing and self.result is not None and self.result.type != cm.ACTION_NONE:
+            self.result.duration_ms = duration_ms
         self.destroy()
 
 
@@ -776,21 +849,29 @@ class BindingsTab(ttk.Frame):
         paned = ttk.Panedwindow(self, orient="vertical")
         paned.pack(fill="both", expand=True, padx=8, pady=(0, 6))
 
-        direct = ttk.LabelFrame(paned, text="Direct bindings (double-click a Tap/Hold/Double cell to edit)")
-        columns = ("input", "tap", "hold", "double")
+        direct = ttk.LabelFrame(
+            paned, text="Direct bindings (double-click to edit; While pressed and Hold are alternatives)"
+        )
+        columns = ("input", "tap", "while_pressed", "hold", "double")
         self.tree = ttk.Treeview(direct, columns=columns, show="headings", selectmode="browse", height=12)
         self.tree.heading("input", text="Controller input")
         self.tree.heading("tap", text="Tap")
-        self.tree.heading("hold", text="Hold / while pressed")
+        self.tree.heading("while_pressed", text="While pressed (immediate)")
+        self.tree.heading("hold", text="Hold (after delay)")
         self.tree.heading("double", text="Double tap")
         self.tree.column("input", width=130)
         self.tree.column("tap", width=200)
+        self.tree.column("while_pressed", width=200)
         self.tree.column("hold", width=200)
         self.tree.column("double", width=200)
         direct_scroll = ttk.Scrollbar(direct, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=direct_scroll.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=5)
-        direct_scroll.pack(side="right", fill="y", padx=(0, 5), pady=5)
+        direct_xscroll = ttk.Scrollbar(direct, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=direct_scroll.set, xscrollcommand=direct_xscroll.set)
+        direct.rowconfigure(0, weight=1)
+        direct.columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky="nsew", padx=(6, 0), pady=(5, 0))
+        direct_scroll.grid(row=0, column=1, sticky="ns", padx=(0, 5), pady=(5, 0))
+        direct_xscroll.grid(row=1, column=0, sticky="ew", padx=(6, 0), pady=(0, 5))
 
         self.tree.bind("<Double-1>", self._edit)
         paned.add(direct, weight=3)
@@ -901,16 +982,16 @@ class BindingsTab(ttk.Frame):
                 self.app.config, self.app.config.bindings[profile][source][cm.GESTURE_TAP]
             )
             hold_action = self.app.config.bindings[profile][source][cm.GESTURE_HOLD]
-            hold = format_action_for_config(self.app.config, hold_action)
-            if hold_action.type != cm.ACTION_NONE and hold_action.duration_ms == 1:
-                hold = f"While pressed: {hold}"
+            while_pressed, hold = format_hold_binding(self.app.config, hold_action)
             double = format_action_for_config(
                 self.app.config, self.app.config.bindings[profile][source][cm.GESTURE_DOUBLE]
             )
             input_name = cm.SOURCE_NAMES[source]
             if source >= cm.SRC_LSTICK_UP:
                 input_name += " (direction)"
-            self.tree.insert("", "end", iid=str(source), values=(input_name, tap, hold, double))
+            self.tree.insert(
+                "", "end", iid=str(source), values=(input_name, tap, while_pressed, hold, double)
+            )
 
         for index, (rule, value) in enumerate(build_profile_stick_rows(self.app.config, profile)):
             self.stick_tree.insert("", "end", iid=str(index), values=(rule, value))
@@ -925,37 +1006,38 @@ class BindingsTab(ttk.Frame):
                 "", "end", iid=str(slot), values=(slot + 1, name, trigger, bound, steps)
             )
 
-    def _edit(self, _event: tk.Event) -> None:
-        selection = self.tree.selection()
-        if not selection:
+    def _edit(self, event: tk.Event) -> None:
+        if self.app.config is None:
             return
-        source = int(selection[0])
+        row = self.tree.identify_row(event.y)
+        column = self.tree.identify_column(event.x)
+        gesture_index = {
+            "#2": cm.GESTURE_TAP,
+            "#3": cm.GESTURE_HOLD,
+            "#4": cm.GESTURE_HOLD,
+            "#5": cm.GESTURE_DOUBLE,
+        }.get(column)
+        if not row or gesture_index is None:
+            return
+        source = int(row)
         profile = self._profile()
-        gesture = self.tree.identify_column(self.tree.winfo_pointerx() - self.tree.winfo_rootx())
-        column_index = max(0, int(gesture.replace("#", "")) - 1)
-        gesture_index = {1: cm.GESTURE_TAP, 2: cm.GESTURE_HOLD, 3: cm.GESTURE_DOUBLE}.get(
-            column_index, cm.GESTURE_TAP
-        )
-        action = self.app.config.bindings[profile][source][gesture_index]
+        action = copy.deepcopy(self.app.config.bindings[profile][source][gesture_index])
+        gesture_name = cm.GESTURE_NAMES[gesture_index]
+        if gesture_index == cm.GESTURE_HOLD:
+            if column == "#3":
+                action.duration_ms = 1
+                gesture_name = "While pressed"
+            elif action.duration_ms == 1:
+                action.duration_ms = 0
         dialog = ActionDialog(
             self,
-            f"{cm.SOURCE_NAMES[source]} - {cm.GESTURE_NAMES[gesture_index]}",
+            f"{cm.SOURCE_NAMES[source]} - {gesture_name}",
             action,
             [macro.name for macro in self.app.config.macros],
+            edit_hold_timing=gesture_index == cm.GESTURE_HOLD,
         )
         self.wait_window(dialog)
         if dialog.result is not None:
-            if gesture_index == cm.GESTURE_HOLD and dialog.result.type in (
-                cm.ACTION_KEY,
-                cm.ACTION_MODIFIER_KEY,
-                cm.ACTION_MOUSE_BUTTON,
-                cm.ACTION_WHEEL_UP_TURBO,
-                cm.ACTION_WHEEL_DOWN_TURBO,
-                cm.ACTION_WHEEL_UP_COMBO,
-                cm.ACTION_WHEEL_DOWN_COMBO,
-            ):
-                # Keep the firmware's hold delay (0 = global threshold, 1 = immediate).
-                dialog.result.duration_ms = action.duration_ms
             self.app.config.bindings[profile][source][gesture_index] = dialog.result
             self.refresh()
 
