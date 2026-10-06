@@ -24,6 +24,19 @@ typedef struct __attribute__((packed)) {
     uint8_t pad[MAPPER_STORE_SLOT_SIZE - 24u - MAPPER_STORE_PAYLOAD_SIZE];
 } mapper_store_record_t;
 
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t schema_version;
+    uint32_t payload_size;
+    uint32_t crc32;
+    uint32_t save_counter;
+    uint32_t header_crc32;
+    uint8_t payload[MAPPER_STORE_LEGACY_PAYLOAD_SIZE];
+    uint8_t pad[MAPPER_STORE_LEGACY_SLOT_SIZE - 24u -
+                MAPPER_STORE_LEGACY_PAYLOAD_SIZE];
+} mapper_store_legacy_record_t;
+
 _Static_assert(sizeof(mapper_store_record_t) == MAPPER_STORE_SLOT_SIZE,
                "mapper_store_record_t must be one flash slot");
 _Static_assert(offsetof(mapper_store_record_t, payload) == 24u,
@@ -34,6 +47,9 @@ _Static_assert((MAPPER_STORE_SLOT_SIZE % FLASH_PAGE_SIZE) == 0u,
                "mapper store slot must be flash-page aligned");
 _Static_assert(PICO_FLASH_SIZE_BYTES >= (2u * MAPPER_STORE_SLOT_SIZE),
                "flash must fit both mapper store slots");
+_Static_assert(sizeof(mapper_store_legacy_record_t) ==
+                   MAPPER_STORE_LEGACY_SLOT_SIZE,
+               "legacy mapper store record must remain 8192 bytes");
 
 static mapper_store_record_t g_store_record;
 static bool g_store_has_valid_record = false;
@@ -50,6 +66,17 @@ static uint32_t store_slot_offset_b(void) {
 
 static uint32_t store_slot_offset(uint32_t slot_index) {
     return slot_index == 0 ? store_slot_offset_a() : store_slot_offset_b();
+}
+
+static uint32_t store_legacy_slot_offset(uint32_t slot_index) {
+    /* PICO_FLASH_SIZE_BYTES remains the physical flash size in C even though
+     * the linker region is shortened. Firmware <=2.0.x stored two 8 KiB
+     * records at the physical end of flash. */
+    return slot_index == 0
+               ? (uint32_t)PICO_FLASH_SIZE_BYTES -
+                     (2u * MAPPER_STORE_LEGACY_SLOT_SIZE)
+               : (uint32_t)PICO_FLASH_SIZE_BYTES -
+                     MAPPER_STORE_LEGACY_SLOT_SIZE;
 }
 
 static const uint8_t *store_slot_bytes(uint32_t offset) {
@@ -72,6 +99,29 @@ static bool store_record_valid(const mapper_store_record_t *record) {
         return false;
     }
     uint32_t crc = mapper_config_crc32(record->payload, MAPPER_STORE_PAYLOAD_SIZE);
+    return crc == record->crc32;
+}
+
+static bool store_legacy_record_valid(
+    const mapper_store_legacy_record_t *record
+) {
+    bool supported_schema =
+        record->schema_version == MAPPER_STORE_SCHEMA_VERSION ||
+        record->schema_version == MAPPER_STORE_SCHEMA_VERSION_LEGACY;
+    if (record->magic != MAPPER_STORE_MAGIC ||
+        record->version != MAPPER_STORE_VERSION ||
+        !supported_schema ||
+        record->payload_size != MAPPER_STORE_LEGACY_PAYLOAD_SIZE) {
+        return false;
+    }
+    uint32_t header_crc = mapper_config_crc32(
+        (const uint8_t *)record,
+        offsetof(mapper_store_legacy_record_t, header_crc32));
+    if (header_crc != record->header_crc32) {
+        return false;
+    }
+    uint32_t crc = mapper_config_crc32(
+        record->payload, MAPPER_STORE_LEGACY_PAYLOAD_SIZE);
     return crc == record->crc32;
 }
 
@@ -101,27 +151,55 @@ bool mapper_store_load(void) {
         }
     }
 
-    if (valid_count == 0 || best_record == NULL) {
-        g_store_has_valid_record = false;
-        g_store_next_counter = 1;
-        return false;
+    if (valid_count != 0 && best_record != NULL) {
+        if (!mapper_config_apply_payload(best_record->payload)) {
+            g_store_has_valid_record = false;
+            return false;
+        }
+
+        g_store_has_valid_record = true;
+        g_store_active_slot = best_slot;
+        g_store_next_counter = best_counter + 1;
+        return true;
     }
 
-    if (!mapper_config_apply_payload(best_record->payload)) {
+    const mapper_store_legacy_record_t *best_legacy = NULL;
+    uint16_t best_legacy_schema = 0;
+    valid_count = 0;
+    best_counter = 0;
+    for (uint32_t slot = 0; slot < 2; slot++) {
+        const mapper_store_legacy_record_t *record =
+            (const mapper_store_legacy_record_t *)store_slot_bytes(
+                store_legacy_slot_offset(slot));
+        if (!store_legacy_record_valid(record)) {
+            continue;
+        }
+        valid_count++;
+        if (valid_count == 1 ||
+            store_counter_is_newer(record->save_counter, best_counter)) {
+            best_counter = record->save_counter;
+            best_legacy = record;
+            best_legacy_schema = record->schema_version;
+        }
+    }
+
+    if (best_legacy == NULL ||
+        !mapper_config_apply_legacy_payload(best_legacy->payload)) {
         g_store_has_valid_record = false;
+        g_store_next_counter = 1;
         return false;
     }
 
     /* Schema 1 shipped 12 ms as its default. Migrate only that exact legacy
      * default; explicit 0 and every other saved value remain untouched. A
      * later user save writes schema 2, where an explicit 12 stays 12. */
-    if (best_record->schema_version == MAPPER_STORE_SCHEMA_VERSION_LEGACY &&
+    if (best_legacy_schema == MAPPER_STORE_SCHEMA_VERSION_LEGACY &&
         mapper_config_get()->settings.mouse_release_grace_ms == 12u) {
         mapper_config_get()->settings.mouse_release_grace_ms = 40u;
     }
 
     g_store_has_valid_record = true;
-    g_store_active_slot = best_slot;
+    g_store_active_slot = 0;
     g_store_next_counter = best_counter + 1;
     return true;
 }

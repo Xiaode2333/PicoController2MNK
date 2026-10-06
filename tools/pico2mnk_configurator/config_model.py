@@ -1,6 +1,6 @@
 """Binary config payload model matching mapper_config.h exactly.
 
-The firmware and desktop app share a packed 8000-byte config payload. All
+The firmware and desktop app share a packed 8816-byte config payload. All
 multi-byte fields are little-endian.
 """
 
@@ -8,20 +8,35 @@ from __future__ import annotations
 
 import math
 import struct
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
+from typing import Any
 
 PROFILE_COUNT = 3
 SOURCE_COUNT = 25
 GESTURE_COUNT = 3
-COMBO_MAX = 16
+COMBO_MAX = 64
 MACRO_MAX = 8
 MACRO_STEP_MAX = 64
 MACRO_NAME_MAX = 24
-PAYLOAD_SIZE = 8000
+PAYLOAD_SIZE = 8816
 ADVANCED_STICK_VERSION = 1
-VIRTUAL_DPI_DEFAULT = 1000
+VIRTUAL_DPI_DEFAULT = 5000
 VIRTUAL_DPI_MIN = 100
 VIRTUAL_DPI_MAX = 20000
+MOUSE_MODE_SENSITIVITY_MIN = 1
+MOUSE_MODE_SENSITIVITY_MAX = 1000
+MOUSE_MODE_VERSION_VALUE = 0x4D01
+PROFILE2_AIM_SOURCE_RESERVED_INDEX = 6
+PROFILE2_AIM_SOURCE_TAG = 0x4100
+MOUSE_MODE_RESERVED_INDEXES = {
+    "sensitivity_1": 1,
+    "sensitivity_2": 2,
+    "deadzone_1": 3,
+    "deadzone_2": 4,
+    "version": 5,
+}
+JSON_FORMAT_ID = "pico-controller2mnk-config"
+JSON_FORMAT_VERSION = 3
 
 # Logical input IDs
 (
@@ -104,7 +119,27 @@ GESTURE_NAMES = ["Tap", "Hold", "Double tap"]
     ACTION_MACRO,
     ACTION_ALT_TAP_KEY,
     ACTION_SNAPSHOT_MACRO,
-) = range(11)
+    ACTION_MOUSE_MODE_TOGGLE_KEY,
+    ACTION_MOUSE_MODE_SWAP,
+    ACTION_TWO_KEYS,
+    ACTION_STOP_ALL,
+) = range(15)
+
+ACTION_MODE_NORMAL = 0
+ACTION_MODE_TOGGLE = 0x80
+ACTION_MODE_CLICK = 0x81
+ACTION_MODE_PRESS = 0x82
+ACTION_MODE_RELEASE = 0x83
+MACRO_TRIGGER_OVERRIDE = 0x80
+ACTION_INPUT_TAG = 0x4000
+INPUT_WHILE_ACTIVE, INPUT_PRESSED, INPUT_RELEASED, INPUT_CLICK = range(4)
+INPUT_EVENT_NAMES = ("While active (pressed)", "On press (pressed edge)",
+                     "On release (released edge)", "Click (short press + release)")
+TOGGLE_ACTION_TYPES = frozenset((
+    ACTION_KEY, ACTION_MODIFIER_KEY, ACTION_TWO_KEYS, ACTION_MOUSE_BUTTON,
+    ACTION_WHEEL_UP_TURBO, ACTION_WHEEL_DOWN_TURBO,
+    ACTION_WHEEL_UP_COMBO, ACTION_WHEEL_DOWN_COMBO,
+))
 
 ACTION_NAMES = {
     ACTION_NONE: "None",
@@ -118,6 +153,10 @@ ACTION_NAMES = {
     ACTION_MACRO: "Macro",
     ACTION_ALT_TAP_KEY: "Alternating 1/2",
     ACTION_SNAPSHOT_MACRO: "Snapshot macro",
+    ACTION_MOUSE_MODE_TOGGLE_KEY: "Toggle mouse mode + key",
+    ACTION_MOUSE_MODE_SWAP: "Swap mouse modes",
+    ACTION_TWO_KEYS: "Two keys",
+    ACTION_STOP_ALL: "Stop macros / release toggles",
 }
 
 MOD_LEFTCTRL = 0x01
@@ -144,7 +183,31 @@ MOUSE_LEFT = 0x01
 MOUSE_RIGHT = 0x02
 MOUSE_MIDDLE = 0x04
 
-MACRO_STEP_DELAY, MACRO_STEP_KEYBOARD, MACRO_STEP_MOUSE = range(3)
+(
+    MACRO_STEP_DELAY,
+    MACRO_STEP_KEYBOARD,
+    MACRO_STEP_MOUSE,
+    MACRO_STEP_WHEEL_UP_TURBO,
+    MACRO_STEP_WHEEL_DOWN_TURBO,
+    MACRO_STEP_WHEEL_UP_COMBO,
+    MACRO_STEP_WHEEL_DOWN_COMBO,
+    MACRO_STEP_ALT_TAP_KEY,
+    MACRO_STEP_MOUSE_MODE_TOGGLE_KEY,
+    MACRO_STEP_MOUSE_MODE_SWAP,
+) = range(10)
+
+MACRO_STEP_NAMES = {
+    MACRO_STEP_DELAY: "Delay",
+    MACRO_STEP_KEYBOARD: "Keyboard keys / modifiers",
+    MACRO_STEP_MOUSE: "Mouse buttons / movement / wheel",
+    MACRO_STEP_WHEEL_UP_TURBO: "Wheel up (turbo)",
+    MACRO_STEP_WHEEL_DOWN_TURBO: "Wheel down (turbo)",
+    MACRO_STEP_WHEEL_UP_COMBO: "Wheel up (combo)",
+    MACRO_STEP_WHEEL_DOWN_COMBO: "Wheel down (combo)",
+    MACRO_STEP_ALT_TAP_KEY: "Alternating 1/2",
+    MACRO_STEP_MOUSE_MODE_TOGGLE_KEY: "Toggle mouse mode + key",
+    MACRO_STEP_MOUSE_MODE_SWAP: "Swap mouse modes",
+}
 (
     MACRO_TRIGGER_PRESS,
     MACRO_TRIGGER_RELEASE,
@@ -249,10 +312,10 @@ def _documented_default_bindings() -> list[list[list[Action]]]:
     tap_hold(0, SRC_DPAD_DOWN, "3", "4")
     key(0, SRC_DPAD_LEFT, "B")
     key(0, SRC_DPAD_RIGHT, "`")
-    mouse(0, SRC_LB, MOUSE_RIGHT)
-    mouse(0, SRC_RB, MOUSE_LEFT)
-    key(0, SRC_LT, "Q")
-    key(0, SRC_RT, "E")
+    key(0, SRC_LB, "Q")
+    key(0, SRC_RB, "E")
+    mouse(0, SRC_LT, MOUSE_RIGHT)
+    mouse(0, SRC_RT, MOUSE_LEFT)
     tap_hold(0, SRC_X, "R", "F")
     key(0, SRC_A, "Space")
     tap_hold(0, SRC_B, "C", "Z")
@@ -331,28 +394,29 @@ def _documented_default_combos() -> list[Combo]:
         combos[index] = Combo(profiles, sources, suppress, action)
 
     lt_rt = mask(SRC_LT, SRC_RT)
+    lb_rb = mask(SRC_LB, SRC_RB)
     for index, source, key_name in (
         (0, SRC_X, "1"),
         (1, SRC_Y, "2"),
         (2, SRC_A, "3"),
         (3, SRC_B, "4"),
     ):
-        sources = lt_rt | mask(source)
+        sources = lb_rb | mask(source)
         set_combo(
             index, 0x03, sources, sources,
             Action(type=ACTION_MODIFIER_KEY, param1=MOD_LEFTCTRL,
                    param2=HID_NAME_TO_KEY[key_name]),
         )
 
-    wheel_up = lt_rt | mask(SRC_DPAD_UP)
-    wheel_down = lt_rt | mask(SRC_DPAD_DOWN)
+    wheel_up = lb_rb | mask(SRC_DPAD_UP)
+    wheel_down = lb_rb | mask(SRC_DPAD_DOWN)
     set_combo(4, 0x07, wheel_up, wheel_up, Action(type=ACTION_WHEEL_UP_COMBO))
     set_combo(5, 0x07, wheel_down, wheel_down, Action(type=ACTION_WHEEL_DOWN_COMBO))
 
-    sources = lt_rt | mask(SRC_DPAD_LEFT)
+    sources = lb_rb | mask(SRC_DPAD_LEFT)
     set_combo(6, 0x01, sources, sources,
-              Action(type=ACTION_KEY, param1=HID_NAME_TO_KEY["F4"]))
-    sources = lt_rt | mask(SRC_DPAD_RIGHT)
+              Action(type=ACTION_MACRO, param1=1))
+    sources = lb_rb | mask(SRC_DPAD_RIGHT)
     set_combo(7, 0x01, sources, sources,
               Action(type=ACTION_KEY, param1=HID_NAME_TO_KEY["H"]))
 
@@ -372,6 +436,9 @@ def _documented_default_combos() -> list[Combo]:
               Action(type=ACTION_KEY, param1=HID_NAME_TO_KEY["Q"]))
     set_combo(14, 0x04, mask(SRC_LB, SRC_RT), mask(SRC_RT),
               Action(type=ACTION_KEY, param1=HID_NAME_TO_KEY["E"]))
+    set_combo(15, 0x01, mask(SRC_LT), 0,
+              Action(type=ACTION_MODIFIER_KEY, param1=MOD_LEFTSHIFT,
+                     duration_ms=500))
     return combos
 
 
@@ -390,6 +457,17 @@ def _documented_default_macros() -> list[Macro]:
             MacroStep(type=MACRO_STEP_KEYBOARD, duration_ms=1),
         ],
     )
+    macros[1] = Macro(
+        name="Alt+MB Right",
+        step_count=2,
+        trigger_mode=MACRO_TRIGGER_PRESS,
+        steps=[
+            MacroStep(type=MACRO_STEP_KEYBOARD, modifier=MOD_LEFTALT,
+                      duration_ms=50),
+            MacroStep(type=MACRO_STEP_MOUSE,
+                      keys=(MOUSE_RIGHT, 0, 0, 0, 0, 0), duration_ms=50),
+        ],
+    )
     return macros
 
 
@@ -403,17 +481,20 @@ class Settings:
     double_click_ms: int = 250
     wheel_turbo_hz: int = 30
     wheel_combo_hz: int = 10
-    mouse_release_grace_ms: int = 40
+    mouse_release_grace_ms: int = 0
     left_deadzone: float = 0.10
-    right_deadzone: float = 0.06
+    right_deadzone: float = 0.02
     mouse_speed_x: list[int] = field(default_factory=lambda: [5000, 5000, 5000])
     mouse_speed_y: list[int] = field(default_factory=lambda: [5000, 4166, 5000])
     virtual_dpi: int = VIRTUAL_DPI_DEFAULT
-    right_center_x: int = 2048
-    right_center_y: int = 2048
+    mouse_mode_sensitivity: list[int] = field(default_factory=lambda: [100, 50])
+    mouse_mode_deadzone: list[float] = field(default_factory=lambda: [0.02, 0.02])
+    right_center_x: int = 2014
+    right_center_y: int = 2043
     advanced_stick_version: int = ADVANCED_STICK_VERSION
     profile2_accel_enabled: int = 1
     profile2_outer_threshold_percent: int = 95
+    profile2_aim_source: int = SRC_RB
     profile2_rb_speed_x: int = 3750
     profile2_rb_speed_y: int = 2000
     profile2_no_rb_ramp_ms: int = 300
@@ -438,6 +519,163 @@ class ConfigPayload:
             self.combos = _documented_default_combos()
         if not self.macros:
             self.macros = _documented_default_macros()
+
+
+def config_to_json_document(
+    config: ConfigPayload, *, app_version: str | None = None
+) -> dict[str, Any]:
+    """Return the stable, versioned JSON representation of a configuration."""
+    validate_config(config)
+    document: dict[str, Any] = {
+        "format": JSON_FORMAT_ID,
+        "format_version": JSON_FORMAT_VERSION,
+        "config": asdict(config),
+    }
+    if app_version:
+        document["exported_by"] = {
+            "application": "PicoController2MNK Configurator",
+            "version": app_version,
+        }
+    return document
+
+
+def _json_object(value: object, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must be a JSON object")
+    return value
+
+
+def _overlay_simple_dataclass(instance: object, raw: object, path: str) -> None:
+    values = _json_object(raw, path)
+    for item in fields(instance):
+        if item.name in values:
+            value = values[item.name]
+            if isinstance(getattr(instance, item.name), list):
+                if not isinstance(value, list):
+                    raise ValueError(f"{path}.{item.name} must be a JSON array")
+                value = list(value)
+            setattr(instance, item.name, value)
+
+
+def _action_from_json(raw: object, path: str) -> Action:
+    action = Action()
+    _overlay_simple_dataclass(action, raw, path)
+    return action
+
+
+def _macro_step_from_json(raw: object, path: str) -> MacroStep:
+    step = MacroStep()
+    values = _json_object(raw, path)
+    for item in fields(step):
+        if item.name not in values:
+            continue
+        value = values[item.name]
+        if item.name == "keys":
+            if not isinstance(value, (list, tuple)):
+                raise ValueError(f"{path}.keys must be a JSON array")
+            value = tuple(value)
+        setattr(step, item.name, value)
+    return step
+
+
+def config_from_json_document(document: object) -> ConfigPayload:
+    """Load a versioned document or a legacy bare config object.
+
+    Missing fields retain current defaults, allowing future app versions to
+    migrate older files naturally. Unknown fields in a supported format are
+    ignored. A newer format version is rejected to prevent silent data loss.
+    """
+    root = _json_object(document, "document")
+    if "format" in root or "format_version" in root or "config" in root:
+        if root.get("format") != JSON_FORMAT_ID:
+            raise ValueError(
+                f"unsupported configuration format {root.get('format')!r}"
+            )
+        version = root.get("format_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version < 1:
+            raise ValueError("format_version must be a positive integer")
+        if version > JSON_FORMAT_VERSION:
+            raise ValueError(
+                f"configuration format version {version} is newer than this "
+                f"app supports ({JSON_FORMAT_VERSION})"
+            )
+        raw_config = _json_object(root.get("config"), "config")
+    else:
+        # Compatibility with prototype/hand-authored files that stored the
+        # ConfigPayload object directly without a versioned envelope.
+        raw_config = root
+
+    config = ConfigPayload()
+
+    if "settings" in raw_config:
+        raw_settings = _json_object(raw_config["settings"], "config.settings")
+        _overlay_simple_dataclass(config.settings, raw_settings, "config.settings")
+        if "mouse_mode_deadzone" not in raw_settings:
+            # JSON files created before dual mouse modes used the one global
+            # right-stick deadzone. Preserve that tuning in both new modes.
+            config.settings.mouse_mode_deadzone = [
+                config.settings.right_deadzone,
+                config.settings.right_deadzone,
+            ]
+
+    if "bindings" in raw_config:
+        raw_bindings = raw_config["bindings"]
+        if not isinstance(raw_bindings, list):
+            raise ValueError("config.bindings must be a JSON array")
+        for profile, raw_profile in enumerate(raw_bindings[:PROFILE_COUNT]):
+            if not isinstance(raw_profile, list):
+                raise ValueError(f"config.bindings[{profile}] must be a JSON array")
+            for source, raw_source in enumerate(raw_profile[:SOURCE_COUNT]):
+                if not isinstance(raw_source, list):
+                    raise ValueError(
+                        f"config.bindings[{profile}][{source}] must be a JSON array"
+                    )
+                for gesture, raw_action in enumerate(raw_source[:GESTURE_COUNT]):
+                    config.bindings[profile][source][gesture] = _action_from_json(
+                        raw_action,
+                        f"config.bindings[{profile}][{source}][{gesture}]",
+                    )
+
+    if "combos" in raw_config:
+        raw_combos = raw_config["combos"]
+        if not isinstance(raw_combos, list):
+            raise ValueError("config.combos must be a JSON array")
+        for index, raw_combo in enumerate(raw_combos[:COMBO_MAX]):
+            values = _json_object(raw_combo, f"config.combos[{index}]")
+            combo = Combo()
+            for name in ("profile_mask", "source_mask", "suppress_sources"):
+                if name in values:
+                    setattr(combo, name, values[name])
+            if "action" in values:
+                combo.action = _action_from_json(
+                    values["action"], f"config.combos[{index}].action"
+                )
+            config.combos[index] = combo
+
+    if "macros" in raw_config:
+        raw_macros = raw_config["macros"]
+        if not isinstance(raw_macros, list):
+            raise ValueError("config.macros must be a JSON array")
+        for index, raw_macro in enumerate(raw_macros[:MACRO_MAX]):
+            values = _json_object(raw_macro, f"config.macros[{index}]")
+            macro = Macro()
+            for name in ("name", "step_count", "trigger_mode"):
+                if name in values:
+                    setattr(macro, name, values[name])
+            if "steps" in values:
+                raw_steps = values["steps"]
+                if not isinstance(raw_steps, list):
+                    raise ValueError(f"config.macros[{index}].steps must be a JSON array")
+                macro.steps = [
+                    _macro_step_from_json(
+                        raw_step, f"config.macros[{index}].steps[{step_index}]"
+                    )
+                    for step_index, raw_step in enumerate(raw_steps[:MACRO_STEP_MAX])
+                ]
+            config.macros[index] = macro
+
+    validate_config(config)
+    return config
 
 
 _ACTION_STRUCT = struct.Struct("<BBBBhH")
@@ -467,12 +705,21 @@ def _require_finite(value: object, path: str) -> float:
 
 
 def _validate_action(action: Action, path: str) -> None:
-    _require_int_range(action.type, ACTION_NONE, ACTION_SNAPSHOT_MACRO, f"{path}.type")
+    _require_int_range(action.type, ACTION_NONE, ACTION_STOP_ALL, f"{path}.type")
     _require_int_range(action.param1, 0, 0xFF, f"{path}.param1")
     _require_int_range(action.param2, 0, 0xFF, f"{path}.param2")
     _require_int_range(action.trigger_mode, 0, 0xFF, f"{path}.trigger_mode")
     _require_int_range(action.value, -0x8000, 0x7FFF, f"{path}.value")
     _require_int_range(action.duration_ms, 0, 0xFFFF, f"{path}.duration_ms")
+    if action.trigger_mode & MACRO_TRIGGER_OVERRIDE:
+        if action.type == ACTION_MACRO:
+            valid_mode = action.trigger_mode <= (MACRO_TRIGGER_OVERRIDE | MACRO_TRIGGER_TOGGLE)
+        else:
+            valid_mode = action.type in TOGGLE_ACTION_TYPES and action.trigger_mode <= ACTION_MODE_RELEASE
+        if not valid_mode:
+            raise ValueError(f"{path}.trigger_mode is unsupported for this action")
+    if action_input_event(action) != INPUT_WHILE_ACTIVE and action.type in (ACTION_NONE, ACTION_MACRO):
+        raise ValueError(f"{path}.value: macro playback controls its own input edges")
 
     if action.type == ACTION_MACRO and action.param1 >= MACRO_MAX:
         raise ValueError(
@@ -485,7 +732,9 @@ def _validate_action(action: Action, path: str) -> None:
 
 
 def _validate_macro_step(step: MacroStep, path: str) -> None:
-    _require_int_range(step.type, MACRO_STEP_DELAY, MACRO_STEP_MOUSE, f"{path}.type")
+    _require_int_range(
+        step.type, MACRO_STEP_DELAY, MACRO_STEP_MOUSE_MODE_SWAP, f"{path}.type"
+    )
     _require_int_range(step.modifier, 0, 0xFF, f"{path}.modifier")
     if len(step.keys) > 6:
         raise ValueError(f"{path}.keys has {len(step.keys)} entries, maximum is 6")
@@ -546,6 +795,23 @@ def validate_config(config: ConfigPayload) -> None:
         VIRTUAL_DPI_MAX,
         "settings.virtual_dpi",
     )
+    if len(settings.mouse_mode_sensitivity) != 2:
+        raise ValueError("settings.mouse_mode_sensitivity must contain 2 entries")
+    for index, value in enumerate(settings.mouse_mode_sensitivity):
+        _require_int_range(
+            value,
+            MOUSE_MODE_SENSITIVITY_MIN,
+            MOUSE_MODE_SENSITIVITY_MAX,
+            f"settings.mouse_mode_sensitivity[{index}]",
+        )
+    if len(settings.mouse_mode_deadzone) != 2:
+        raise ValueError("settings.mouse_mode_deadzone must contain 2 entries")
+    for index, raw_value in enumerate(settings.mouse_mode_deadzone):
+        value = _require_finite(raw_value, f"settings.mouse_mode_deadzone[{index}]")
+        if not 0.0 <= value < 1.0:
+            raise ValueError(
+                f"settings.mouse_mode_deadzone[{index}] must be in [0.0, 1.0)"
+            )
     _require_int_range(settings.right_center_x, 0, 4095, "settings.right_center_x")
     _require_int_range(settings.right_center_y, 0, 4095, "settings.right_center_y")
     _require_int_range(
@@ -556,6 +822,9 @@ def validate_config(config: ConfigPayload) -> None:
     )
     _require_int_range(
         settings.profile2_accel_enabled, 0, 1, "settings.profile2_accel_enabled"
+    )
+    _require_int_range(
+        settings.profile2_aim_source, 0, SOURCE_COUNT - 1, "settings.profile2_aim_source"
     )
     _require_int_range(
         settings.profile2_outer_threshold_percent,
@@ -791,11 +1060,27 @@ def encode_payload(config: ConfigPayload) -> bytes:
             combo.action.duration_ms,
         )
 
+    mode_reserved = {
+        MOUSE_MODE_RESERVED_INDEXES["sensitivity_1"]:
+            config.settings.mouse_mode_sensitivity[0],
+        MOUSE_MODE_RESERVED_INDEXES["sensitivity_2"]:
+            config.settings.mouse_mode_sensitivity[1],
+        MOUSE_MODE_RESERVED_INDEXES["deadzone_1"]:
+            int(config.settings.mouse_mode_deadzone[0] * 10000.0 + 0.5),
+        MOUSE_MODE_RESERVED_INDEXES["deadzone_2"]:
+            int(config.settings.mouse_mode_deadzone[1] * 10000.0 + 0.5),
+        MOUSE_MODE_RESERVED_INDEXES["version"]: MOUSE_MODE_VERSION_VALUE,
+        PROFILE2_AIM_SOURCE_RESERVED_INDEX:
+            PROFILE2_AIM_SOURCE_TAG | config.settings.profile2_aim_source,
+    }
     for macro_index, macro in enumerate(config.macros):
         # The firmware stores global virtual DPI in macro 0's two reserved
-        # header bytes. This preserves the established 8000-byte payload and
-        # remains compatible with legacy payloads where both bytes are zero.
-        reserved_value = config.settings.virtual_dpi if macro_index == 0 else 0
+        # header bytes. This preserves the established field position and
+        # remains compatible with migrated legacy payloads where both are zero.
+        reserved_value = (
+            config.settings.virtual_dpi if macro_index == 0
+            else mode_reserved.get(macro_index, 0)
+        )
         out += _pack_macro(macro, reserved_value)
 
     out += _ADVANCED_STICK_STRUCT.pack(
@@ -845,17 +1130,41 @@ def decode_payload(data: bytes) -> ConfigPayload:
         )
 
     macros = []
+    macro_reserved_values = []
     macro_size = _MACRO_HEAD_STRUCT.size + MACRO_STEP_MAX * _MACRO_STEP_STRUCT.size
     for macro_index in range(MACRO_MAX):
         macro_data = data[offset : offset + macro_size]
         macros.append(_unpack_macro(macro_data, macro_index))
+        _name, _count, _trigger, reserved_lo, reserved_hi = (
+            _MACRO_HEAD_STRUCT.unpack_from(macro_data)
+        )
+        reserved_value = reserved_lo | (reserved_hi << 8)
+        macro_reserved_values.append(reserved_value)
         if macro_index == 0:
-            _name, _count, _trigger, dpi_lo, dpi_hi = _MACRO_HEAD_STRUCT.unpack_from(
-                macro_data
-            )
-            raw_dpi = dpi_lo | (dpi_hi << 8)
+            raw_dpi = reserved_value
             settings.virtual_dpi = raw_dpi or VIRTUAL_DPI_DEFAULT
         offset += macro_size
+
+    if (
+        macro_reserved_values[MOUSE_MODE_RESERVED_INDEXES["version"]]
+        == MOUSE_MODE_VERSION_VALUE
+    ):
+        settings.mouse_mode_sensitivity = [
+            macro_reserved_values[MOUSE_MODE_RESERVED_INDEXES["sensitivity_1"]],
+            macro_reserved_values[MOUSE_MODE_RESERVED_INDEXES["sensitivity_2"]],
+        ]
+        settings.mouse_mode_deadzone = [
+            macro_reserved_values[MOUSE_MODE_RESERVED_INDEXES["deadzone_1"]] / 10000.0,
+            macro_reserved_values[MOUSE_MODE_RESERVED_INDEXES["deadzone_2"]] / 10000.0,
+        ]
+    else:
+        settings.mouse_mode_sensitivity = [100, 50]
+        settings.mouse_mode_deadzone = [settings.right_deadzone, settings.right_deadzone]
+
+    aim_value = macro_reserved_values[PROFILE2_AIM_SOURCE_RESERVED_INDEX]
+    if aim_value & 0xFF00 == PROFILE2_AIM_SOURCE_TAG:
+        settings.profile2_aim_source = aim_value & 0xFF
+    # Missing or unrecognized metadata retains the legacy RB Aim input.
 
     advanced = _ADVANCED_STICK_STRUCT.unpack(
         data[offset : offset + _ADVANCED_STICK_STRUCT.size]
@@ -882,12 +1191,51 @@ def decode_payload(data: bytes) -> ConfigPayload:
 
 
 def format_action(action: Action) -> str:
+    text = _format_action_output(action)
+    if action.type in TOGGLE_ACTION_TYPES:
+        prefix = {ACTION_MODE_TOGGLE: "Toggle", ACTION_MODE_CLICK: "Click",
+                  ACTION_MODE_PRESS: "Press / latch", ACTION_MODE_RELEASE: "Release latch"}.get(action.trigger_mode)
+        if prefix:
+            text = f"{prefix}: {text}"
+        if action.trigger_mode == ACTION_MODE_CLICK or (
+            action.trigger_mode < MACRO_TRIGGER_OVERRIDE and action_input_event(action) != INPUT_WHILE_ACTIVE):
+            if action.type not in (ACTION_WHEEL_UP_TURBO, ACTION_WHEEL_DOWN_TURBO, ACTION_WHEEL_UP_COMBO, ACTION_WHEEL_DOWN_COMBO):
+                duration = action_click_ms(action)
+                text += f" ({duration} ms click)" if duration else " (global click duration)"
+    if action.type == ACTION_MACRO and action.trigger_mode & MACRO_TRIGGER_OVERRIDE:
+        return f"{text} ({MACRO_TRIGGER_NAMES[action.trigger_mode & 3]})"
+    if action_input_event(action) != INPUT_WHILE_ACTIVE:
+        text = f"{INPUT_EVENT_NAMES[action_input_event(action)]}: {text}"
+    return text
+
+
+def action_input_event(action: Action) -> int:
+    return action.value & 3 if action.value & 0xC000 == ACTION_INPUT_TAG else INPUT_WHILE_ACTIVE
+
+
+def action_click_ms(action: Action) -> int:
+    return (action.value & 0x3FFC) >> 2 if action.value & 0xC000 == ACTION_INPUT_TAG else 0
+
+
+def action_behavior_value(input_event: int, click_ms: int = 0) -> int:
+    _require_int_range(input_event, 0, 3, "input_event")
+    _require_int_range(click_ms, 0, 4095, "click_ms")
+    return ACTION_INPUT_TAG | (click_ms << 2) | input_event if input_event or click_ms else 0
+
+
+def effective_macro_trigger(config: ConfigPayload, action: Action) -> int:
+    if action.trigger_mode & MACRO_TRIGGER_OVERRIDE:
+        return action.trigger_mode & 3
+    return config.macros[action.param1].trigger_mode
+
+
+def _format_action_output(action: Action) -> str:
     if action.type == ACTION_NONE:
         return "None"
     if action.type == ACTION_KEY:
         return f"Key {HID_KEY_NAMES.get(action.param1, hex(action.param1))}"
     if action.type == ACTION_MODIFIER_KEY:
-        mod = MODIFIER_NAMES.get(action.param1, hex(action.param1))
+        mod = format_modifier_mask(action.param1)
         if action.param2:
             return f"{mod} + {HID_KEY_NAMES.get(action.param2, hex(action.param2))}"
         return mod
@@ -909,6 +1257,18 @@ def format_action(action: Action) -> str:
         return ACTION_NAMES[action.type]
     if action.type == ACTION_MACRO:
         return f"Macro #{action.param1 + 1}"
+    if action.type == ACTION_MOUSE_MODE_TOGGLE_KEY:
+        key = HID_KEY_NAMES.get(action.param1, hex(action.param1))
+        return f"Toggle mouse mode + Key {key}" if action.param1 else "Toggle mouse mode"
+    if action.type == ACTION_MOUSE_MODE_SWAP:
+        return "Swap mouse modes"
+    if action.type == ACTION_TWO_KEYS:
+        keys = [
+            HID_KEY_NAMES.get(key, hex(key))
+            for key in (action.param1, action.param2)
+            if key
+        ]
+        return "Keys " + " + ".join(keys) if keys else "Keys ?"
     return ACTION_NAMES.get(action.type, f"Action {action.type}")
 
 
@@ -951,6 +1311,21 @@ def format_macro_step(step: MacroStep) -> str:
             parts.append(f"wheel {step.value:+d}")
         state = " + ".join(parts) if parts else "neutral"
         return f"Mouse {state} for {step.duration_ms} ms"
+    if step.type in (
+        MACRO_STEP_WHEEL_UP_TURBO,
+        MACRO_STEP_WHEEL_DOWN_TURBO,
+        MACRO_STEP_WHEEL_UP_COMBO,
+        MACRO_STEP_WHEEL_DOWN_COMBO,
+    ):
+        return f"{MACRO_STEP_NAMES[step.type]} for {step.duration_ms} ms"
+    if step.type == MACRO_STEP_ALT_TAP_KEY:
+        return f"Alternating 1/2 for {step.duration_ms} ms"
+    if step.type == MACRO_STEP_MOUSE_MODE_TOGGLE_KEY:
+        key = step.keys[0] if step.keys else 0
+        suffix = f" + Key {HID_KEY_NAMES.get(key, hex(key))}" if key else ""
+        return f"Toggle mouse mode{suffix} for {step.duration_ms} ms"
+    if step.type == MACRO_STEP_MOUSE_MODE_SWAP:
+        return f"Swap mouse modes, then wait {step.duration_ms} ms"
     return f"Unknown step {step.type}"
 
 

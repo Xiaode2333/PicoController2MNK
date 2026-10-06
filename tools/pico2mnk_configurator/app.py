@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import queue
 import sys
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
-from . import config_model as cm
+from . import __version__, config_model as cm
 from .device_locator import (
     candidate_ports,
     descriptor_flash_port,
@@ -39,6 +40,16 @@ HOLD_TIMING_LABELS = (
     "Hold — use custom delay",
 )
 WINDOWS_APP_USER_MODEL_ID = "Xiaode2333.PicoController2MNK.Configurator"
+OUTPUT_BEHAVIOR_LABELS = (
+    "Hold — stay pressed while input is active",
+    "Toggle — activate again to release",
+    "Click — press then release after duration",
+    "Pressed — latch until explicit Release / Stop",
+    "Released — clear matching Pressed / Toggle latches",
+)
+OUTPUT_BEHAVIOR_MODES = (cm.ACTION_MODE_NORMAL, cm.ACTION_MODE_TOGGLE, cm.ACTION_MODE_CLICK,
+                         cm.ACTION_MODE_PRESS, cm.ACTION_MODE_RELEASE)
+MACRO_BINDING_TRIGGER_LABELS = ("Use macro default", *cm.MACRO_TRIGGER_NAMES)
 
 
 def bundled_resource_path(relative_path: str) -> Path:
@@ -64,12 +75,21 @@ def configure_windows_app_identity() -> None:
 def format_action_for_config(config: cm.ConfigPayload, action: cm.Action) -> str:
     text = cm.format_action(action)
     if action.type == cm.ACTION_MACRO and 0 <= action.param1 < len(config.macros):
-        return f"Macro #{action.param1 + 1}: {config.macros[action.param1].name}"
+        mode = cm.MACRO_TRIGGER_NAMES[cm.effective_macro_trigger(config, action)]
+        return f"Macro #{action.param1 + 1}: {config.macros[action.param1].name} ({mode})"
     if action.type in (cm.ACTION_WHEEL_UP_TURBO, cm.ACTION_WHEEL_DOWN_TURBO):
         return f"{text} ({config.settings.wheel_turbo_hz} Hz)"
     if action.type in (cm.ACTION_WHEEL_UP_COMBO, cm.ACTION_WHEEL_DOWN_COMBO):
         return f"{text} ({config.settings.wheel_combo_hz} Hz)"
     return text
+
+
+def format_combo_action(config: cm.ConfigPayload, action: cm.Action) -> str:
+    """Describe a combo output and its optional activation delay."""
+    text = format_action_for_config(config, action)
+    if action.type == cm.ACTION_NONE or action.duration_ms == 0:
+        return text
+    return f"After {action.duration_ms} ms, hold: {text}"
 
 
 def format_hold_binding(config: cm.ConfigPayload, action: cm.Action) -> tuple[str, str]:
@@ -81,6 +101,69 @@ def format_hold_binding(config: cm.ConfigPayload, action: cm.Action) -> tuple[st
         return text, "None"
     delay = action.duration_ms or config.settings.hold_threshold_ms
     return "None", f"After {delay} ms: {text}"
+
+
+def config_uses_delayed_combos(config: cm.ConfigPayload) -> bool:
+    return any(
+        combo.action.type != cm.ACTION_NONE and combo.action.duration_ms > 0
+        for combo in config.combos
+    )
+
+
+def config_uses_toggle_options(config: cm.ConfigPayload) -> bool:
+    actions = [action for profile in config.bindings for gestures in profile for action in gestures]
+    actions.extend(combo.action for combo in config.combos)
+    return any(action.type == cm.ACTION_STOP_ALL or action.value & 0xC000 == cm.ACTION_INPUT_TAG or
+               action.trigger_mode & cm.MACRO_TRIGGER_OVERRIDE for action in actions)
+
+
+def config_uses_mouse_mode_actions(config: cm.ConfigPayload) -> bool:
+    action_types = {
+        cm.ACTION_MOUSE_MODE_TOGGLE_KEY,
+        cm.ACTION_MOUSE_MODE_SWAP,
+    }
+    return any(
+        action.type in action_types
+        for profile in config.bindings
+        for gestures in profile
+        for action in gestures
+    ) or any(combo.action.type in action_types for combo in config.combos)
+
+
+def config_uses_two_key_actions(config: cm.ConfigPayload) -> bool:
+    return any(
+        action.type == cm.ACTION_TWO_KEYS
+        for profile in config.bindings
+        for gestures in profile
+        for action in gestures
+    ) or any(combo.action.type == cm.ACTION_TWO_KEYS for combo in config.combos)
+
+
+def config_uses_extended_macro_steps(config: cm.ConfigPayload) -> bool:
+    return any(
+        step.type > cm.MACRO_STEP_MOUSE
+        for macro in config.macros
+        for step in macro.steps[: macro.step_count]
+    )
+
+
+def install_mouse_mode_binding(
+    config: cm.ConfigPayload, profile: int, source: int, keycode: int
+) -> None:
+    """Atomically install the Tap/Double behavior on one controller input.
+
+    Direct key defaults commonly live in the immediate Hold cell. Leaving that
+    action in place would fire before double-tap recognition, so selecting the
+    mouse-mode action intentionally replaces all three gestures for the input.
+    """
+    config.bindings[profile][source][cm.GESTURE_TAP] = cm.Action(
+        type=cm.ACTION_MOUSE_MODE_TOGGLE_KEY,
+        param1=keycode,
+    )
+    config.bindings[profile][source][cm.GESTURE_HOLD] = cm.Action()
+    config.bindings[profile][source][cm.GESTURE_DOUBLE] = cm.Action(
+        type=cm.ACTION_MOUSE_MODE_SWAP,
+    )
 
 
 def build_profile_combo_rows(
@@ -98,7 +181,7 @@ def build_profile_combo_rows(
                 index,
                 profiles,
                 cm.format_source_mask(combo.source_mask),
-                format_action_for_config(config, combo.action),
+                format_combo_action(config, combo.action),
                 cm.format_source_mask(combo.suppress_sources),
             )
         )
@@ -117,7 +200,16 @@ def build_profile_stick_rows(config: cm.ConfigPayload, profile: int) -> list[tup
             f"Y {settings.mouse_speed_y[profile]} base counts/s",
         ),
         ("Virtual DPI", f"{settings.virtual_dpi} (shared by all profiles)"),
-        ("Right stick deadzone", f"{settings.right_deadzone:.4f} (shared by all profiles)"),
+        (
+            "Mouse mode 1",
+            f"{settings.mouse_mode_sensitivity[0]}% sensitivity, "
+            f"{settings.mouse_mode_deadzone[0]:.4f} deadzone",
+        ),
+        (
+            "Mouse mode 2",
+            f"{settings.mouse_mode_sensitivity[1]}% sensitivity, "
+            f"{settings.mouse_mode_deadzone[1]:.4f} deadzone",
+        ),
         (
             "Right stick center",
             f"X {settings.right_center_x}, Y {settings.right_center_y} (shared by all profiles)",
@@ -131,7 +223,11 @@ def build_profile_stick_rows(config: cm.ConfigPayload, profile: int) -> list[tup
         rows.extend(
             [
                 (
-                    "Right stick while RB",
+                    "Aim / ADS input",
+                    cm.SOURCE_NAMES[settings.profile2_aim_source],
+                ),
+                (
+                    "Right stick while Aim (ADS)",
                     f"X {settings.profile2_rb_speed_x} base counts/s, "
                     f"Y {settings.profile2_rb_speed_y} base counts/s",
                 ),
@@ -144,12 +240,12 @@ def build_profile_stick_rows(config: cm.ConfigPayload, profile: int) -> list[tup
                     f"{settings.profile2_outer_threshold_percent / 100.0:.2f}",
                 ),
                 (
-                    "Outer ring without RB",
+                    "Outer ring without Aim (hip fire)",
                     f"X +{settings.profile2_no_rb_extra_x} base counts/s over "
                     f"{settings.profile2_no_rb_ramp_ms} ms",
                 ),
                 (
-                    "Outer ring with RB",
+                    "Outer ring while Aim (ADS)",
                     f"wait {settings.profile2_rb_delay_ms} ms, then X/Y "
                     f"+{settings.profile2_rb_extra_x}/+{settings.profile2_rb_extra_y} "
                     "base counts/s "
@@ -172,6 +268,8 @@ def build_profile_macro_rows(
                     gesture_name = "While pressed"
                 bindings[action.param1].append(
                     f"{cm.SOURCE_NAMES[source]} ({gesture_name})"
+                    + (f" [{cm.MACRO_TRIGGER_NAMES[cm.effective_macro_trigger(config, action)]}]"
+                       if action.trigger_mode & cm.MACRO_TRIGGER_OVERRIDE else "")
                 )
     for combo in config.combos:
         if (
@@ -179,7 +277,8 @@ def build_profile_macro_rows(
             and combo.action.type == cm.ACTION_MACRO
             and 0 <= combo.action.param1 < cm.MACRO_MAX
         ):
-            bindings[combo.action.param1].append(f"Combo {cm.format_source_mask(combo.source_mask)}")
+            mode = cm.MACRO_TRIGGER_NAMES[cm.effective_macro_trigger(config, combo.action)]
+            bindings[combo.action.param1].append(f"Combo {cm.format_source_mask(combo.source_mask)} [{mode}]")
 
     return [
         (
@@ -195,18 +294,29 @@ def build_profile_macro_rows(
 
 class ActionDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, title: str, initial: cm.Action,
-                 macro_names: list[str], *, edit_hold_timing: bool = False):
+                 macro_names: list[str], *, edit_combo_delay: bool = False,
+                 edit_hold_timing: bool = False):
         super().__init__(parent)
         self.title(title)
         self.resizable(False, False)
         self.result: Optional[cm.Action] = None
         self.macro_names = macro_names
+        self.edit_combo_delay = edit_combo_delay
         self.edit_hold_timing = edit_hold_timing
 
         self.type_var = tk.StringVar(value=str(initial.type))
         self.param1_var = tk.IntVar(value=initial.param1)
         self.param2_var = tk.IntVar(value=initial.param2)
-        self.trigger_var = tk.IntVar(value=initial.trigger_mode)
+        self.behavior_var = tk.StringVar(value=OUTPUT_BEHAVIOR_LABELS[
+            OUTPUT_BEHAVIOR_MODES.index(initial.trigger_mode)
+            if initial.type in cm.TOGGLE_ACTION_TYPES and initial.trigger_mode in OUTPUT_BEHAVIOR_MODES else 0
+        ])
+        self.input_event_var = tk.StringVar(value=cm.INPUT_EVENT_NAMES[cm.action_input_event(initial)])
+        self.click_ms_var = tk.StringVar(value=str(cm.action_click_ms(initial)))
+        macro_mode_index = ((initial.trigger_mode & 3) + 1
+                            if initial.type == cm.ACTION_MACRO and initial.trigger_mode & cm.MACRO_TRIGGER_OVERRIDE
+                            else 0)
+        self.macro_trigger_var = tk.StringVar(value=MACRO_BINDING_TRIGGER_LABELS[macro_mode_index])
 
         frame = ttk.Frame(self, padding=12)
         frame.grid(row=0, column=0, sticky="nsew")
@@ -226,6 +336,7 @@ class ActionDialog(tk.Toplevel):
         self.dynamic = ttk.Frame(frame)
         self.dynamic.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=8)
 
+        self.combo_delay_var = tk.StringVar(value=str(initial.duration_ms))
         timing_index = 0 if initial.duration_ms == 1 else (1 if initial.duration_ms == 0 else 2)
         self.hold_timing_var = tk.StringVar(value=HOLD_TIMING_LABELS[timing_index])
         self.hold_delay_var = tk.StringVar(
@@ -250,16 +361,76 @@ class ActionDialog(tk.Toplevel):
                 timing_frame,
                 text=(
                     "While pressed starts immediately. Hold starts after the threshold. "
-                    "Both end on release. These modes share one slot; choosing one "
+                    "Output behavior below controls release or Toggle. These modes share one slot; choosing one "
                     "replaces the other for this input. Custom delay: 2-65535 ms."
                 ), wraplength=420,
             ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
             self._refresh_hold_timing()
+        if self.edit_combo_delay:
+            delay_frame = ttk.LabelFrame(frame, text="Combo timing", padding=8)
+            delay_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+            ttk.Label(delay_frame, text="Activation delay (ms)").grid(
+                row=0, column=0, sticky="w"
+            )
+            ttk.Entry(
+                delay_frame, textvariable=self.combo_delay_var, width=12
+            ).grid(row=0, column=1, sticky="w", padx=(8, 0))
+            ttk.Label(
+                delay_frame,
+                text=(
+                    "0 activates immediately; 1-65535 waits that many milliseconds. "
+                    "Output behavior below controls release or Toggle."
+                ),
+                wraplength=420,
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        self.behavior_frame = ttk.LabelFrame(frame, text="Input / output behavior", padding=8)
+        self.behavior_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.input_frame = ttk.Frame(self.behavior_frame)
+        ttk.Label(self.input_frame, text="Input event").pack(anchor="w")
+        ttk.Combobox(self.input_frame, textvariable=self.input_event_var, state="readonly",
+                     values=cm.INPUT_EVENT_NAMES, width=49).pack(fill="x")
+        ttk.Label(self.input_frame,
+            text="Pressed/released are edges of the activation selected above. Click requires release before the global hold threshold; use immediate activation.",
+            wraplength=440).pack(anchor="w", pady=(4, 8))
+        self.output_frame = ttk.Frame(self.behavior_frame)
+        self.output_frame.pack(fill="x")
+        ttk.Label(self.output_frame, text="Output state").pack(anchor="w")
+        ttk.Combobox(
+            self.output_frame, textvariable=self.behavior_var, state="readonly",
+            values=OUTPUT_BEHAVIOR_LABELS, width=49,
+        ).pack(fill="x")
+        click_row = ttk.Frame(self.output_frame)
+        click_row.pack(fill="x", pady=4)
+        ttk.Label(click_row, text="Click duration (ms; 0 = global)").pack(side="left")
+        self.click_ms_entry = ttk.Entry(click_row, textvariable=self.click_ms_var, width=8)
+        self.click_ms_entry.pack(side="left", padx=6)
+        self.behavior_var.trace_add("write", lambda *_args: self._refresh_click_duration())
+        self.input_event_var.trace_add("write", lambda *_args: self._refresh_click_duration())
+        self._refresh_click_duration()
+        ttk.Label(
+            self.output_frame,
+            text=("Hold maintains the HID pressed state; it does not repeatedly click. "
+                  "An input edge with Hold emits a Click. Click duration: 1-4095 ms, "
+                  "or 0 for the global tap duration; a wheel Click sends one notch. "
+                  "Released clears latches with the same action and keys/buttons; "
+                  "other held inputs continue. Profile changes, output off, disconnect "
+                  "and Stop clear all latches."),
+            wraplength=440,
+        ).pack(anchor="w", pady=(6, 0))
 
         self.key_var = tk.IntVar(value=initial.param1 if initial.type == cm.ACTION_KEY else 0)
+        self.first_key_var = tk.IntVar(
+            value=initial.param1 if initial.type == cm.ACTION_TWO_KEYS else 0
+        )
+        self.second_key_var = tk.IntVar(
+            value=initial.param2 if initial.type == cm.ACTION_TWO_KEYS else 0
+        )
         self.mod_var = tk.IntVar(
             value=initial.param1 if initial.type == cm.ACTION_MODIFIER_KEY else 0
         )
+        self.modifier_vars = {bit: tk.BooleanVar(value=bool(self.mod_var.get() & bit))
+                              for bit in cm.MODIFIER_NAMES}
         self.mod_key_var = tk.IntVar(
             value=initial.param2 if initial.type == cm.ACTION_MODIFIER_KEY else 0
         )
@@ -269,6 +440,11 @@ class ActionDialog(tk.Toplevel):
         self.macro_index = tk.IntVar(
             value=initial.param1 if initial.type == cm.ACTION_MACRO else 0
         )
+        self.mouse_mode_key_var = tk.IntVar(
+            value=initial.param1
+            if initial.type == cm.ACTION_MOUSE_MODE_TOGGLE_KEY
+            else cm.HID_NAME_TO_KEY["Tab"]
+        )
 
         self.key_names = ["(none)"] + sorted(
             f"0x{code:02X} {name}" for code, name in cm.HID_KEY_NAMES.items() if code
@@ -277,7 +453,7 @@ class ActionDialog(tk.Toplevel):
         self._refresh()
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=3, column=0, columnspan=2, sticky="e", pady=4)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="e", pady=4)
         ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right", padx=4)
         ttk.Button(buttons, text="OK", command=self._ok).pack(side="right", padx=4)
 
@@ -328,31 +504,51 @@ class ActionDialog(tk.Toplevel):
         custom = self.hold_timing_var.get() == HOLD_TIMING_LABELS[2]
         self.hold_delay_entry.configure(state="normal" if custom else "disabled")
 
+    def _refresh_click_duration(self) -> None:
+        enabled = self.behavior_var.get() == OUTPUT_BEHAVIOR_LABELS[2] or (
+            self.behavior_var.get() == OUTPUT_BEHAVIOR_LABELS[0] and
+            self.input_event_var.get() != cm.INPUT_EVENT_NAMES[0])
+        self.click_ms_entry.configure(state="normal" if enabled else "disabled")
+
     def _refresh(self) -> None:
         self._clear_dynamic()
         action_type = self._current_type()
+        input_supported = (self.edit_combo_delay or self.edit_hold_timing) and (
+            action_type in cm.TOGGLE_ACTION_TYPES or action_type == cm.ACTION_STOP_ALL)
+        if action_type in cm.TOGGLE_ACTION_TYPES or input_supported:
+            self.behavior_frame.grid()
+        else:
+            self.behavior_frame.grid_remove()
+        self.output_frame.pack(fill="x")
+        self.input_frame.pack_forget()
+        if input_supported:
+            self.input_frame.pack(fill="x", before=self.output_frame)
+        if action_type in cm.TOGGLE_ACTION_TYPES:
+            self.output_frame.pack(fill="x")
+        else:
+            self.output_frame.pack_forget()
 
         if action_type == cm.ACTION_NONE:
             ttk.Label(self.dynamic, text="Input will produce no output.").grid(row=0, column=0, columnspan=2)
         elif action_type == cm.ACTION_KEY:
             self._key_combo(0, self.key_var, "Key")
-        elif action_type == cm.ACTION_MODIFIER_KEY:
-            ttk.Label(self.dynamic, text="Modifier").grid(row=0, column=0, sticky="w", pady=3)
-            mod_box = ttk.Combobox(
+        elif action_type == cm.ACTION_TWO_KEYS:
+            self._key_combo(0, self.first_key_var, "First key")
+            self._key_combo(1, self.second_key_var, "Second key")
+            ttk.Label(
                 self.dynamic,
-                state="readonly",
-                values=[f"0x{code:02X} {name}" for code, name in cm.MODIFIER_NAMES.items()],
-                width=26,
-            )
-            mod_box.grid(row=0, column=1, sticky="ew", pady=3)
-            for label in mod_box["values"]:
-                if label.startswith(f"0x{self.mod_var.get():02X} "):
-                    mod_box.set(label)
-                    break
-            mod_box.bind(
-                "<<ComboboxSelected>>",
-                lambda _event, box=mod_box: self.mod_var.set(int(box.get()[2:4], 16)),
-            )
+                text="Both keys use the output behavior selected below.",
+                wraplength=420,
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        elif action_type == cm.ACTION_MODIFIER_KEY:
+            modifiers = ttk.LabelFrame(self.dynamic, text="Modifiers (select one or more)", padding=4)
+            modifiers.grid(row=0, column=0, columnspan=2, sticky="ew")
+            for index, (bit, name) in enumerate(cm.MODIFIER_NAMES.items()):
+                variable = self.modifier_vars[bit]
+                variable.set(bool(self.mod_var.get() & bit))
+                ttk.Checkbutton(modifiers, text=name, variable=variable,
+                    command=lambda: self.mod_var.set(sum(bit for bit, var in self.modifier_vars.items() if var.get()))
+                ).grid(row=index // 4, column=index % 4, sticky="w", padx=3)
             self._key_combo(1, self.mod_key_var, "Key (optional)")
         elif action_type == cm.ACTION_MOUSE_BUTTON:
             ttk.Checkbutton(self.dynamic, text="Left", variable=self.mouse_left).grid(row=0, column=0, sticky="w")
@@ -367,6 +563,11 @@ class ActionDialog(tk.Toplevel):
             cm.ACTION_SNAPSHOT_MACRO,
         ):
             ttk.Label(self.dynamic, text=cm.ACTION_NAMES[action_type]).grid(row=0, column=0, columnspan=2)
+            description = {
+                cm.ACTION_ALT_TAP_KEY: "Each activation alternates key 1/2 and holds that key while activation remains active.",
+                cm.ACTION_SNAPSHOT_MACRO: "Runs the fixed Alt + right-click sequence once per activation. Choose Macro for editable states and timing.",
+            }.get(action_type, "Repeats wheel notches while active, at the matching rate in Settings. Output Click sends one notch; Toggle/Pressed keep repeating after release.")
+            ttk.Label(self.dynamic, text=description, wraplength=440).grid(row=1, column=0, columnspan=2, sticky="w", pady=6)
         elif action_type == cm.ACTION_MACRO:
             ttk.Label(self.dynamic, text="Macro").grid(row=0, column=0, sticky="w", pady=3)
             macro_box = ttk.Combobox(
@@ -385,10 +586,64 @@ class ActionDialog(tk.Toplevel):
                 "<<ComboboxSelected>>",
                 lambda _event, box=macro_box: self.macro_index.set(box.current()),
             )
+            ttk.Label(self.dynamic, text="Playback").grid(row=1, column=0, sticky="w")
+            ttk.Combobox(
+                self.dynamic, textvariable=self.macro_trigger_var, state="readonly",
+                values=MACRO_BINDING_TRIGGER_LABELS, width=26,
+            ).grid(row=1, column=1, sticky="ew", pady=4)
+            ttk.Label(
+                self.dynamic,
+                text=("On press/release plays once. While held repeats until release. "
+                      "Toggle repeats until the next activation. Use While pressed "
+                      "activation for physical press/release control; Tap and Double tap "
+                      "use short gesture pulses. One macro plays at a time; starting "
+                      "another replaces it."), wraplength=440,
+            ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        elif action_type == cm.ACTION_STOP_ALL:
+            ttk.Label(
+                self.dynamic,
+                text="Stops macro playback and clears every latched keyboard, mouse and wheel output. Held inputs must be released before they can trigger again.",
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+        elif action_type == cm.ACTION_MOUSE_MODE_TOGGLE_KEY:
+            self._key_combo(0, self.mouse_mode_key_var, "Key to send (optional)")
+            ttk.Label(
+                self.dynamic,
+                text=(
+                    "On each recognized tap, switches mouse mode 1/2 and sends "
+                    "the selected key once. Choose Tab for an inventory menu."
+                ),
+                wraplength=420,
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        elif action_type == cm.ACTION_MOUSE_MODE_SWAP:
+            ttk.Label(
+                self.dynamic,
+                text=(
+                    "Swaps the logical order of mouse modes 1 and 2 without "
+                    "sending a keyboard key. Put this on Double tap to re-sync "
+                    "the current mode with the game menu."
+                ),
+                wraplength=420,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
 
     def _ok(self) -> None:
         action_type = self._current_type()
         duration_ms = 0
+        input_event = cm.INPUT_WHILE_ACTIVE
+        click_ms = 0
+        if (self.edit_combo_delay or self.edit_hold_timing) and (
+            action_type in cm.TOGGLE_ACTION_TYPES or action_type == cm.ACTION_STOP_ALL):
+            input_event = cm.INPUT_EVENT_NAMES.index(self.input_event_var.get())
+        if action_type in cm.TOGGLE_ACTION_TYPES:
+            try:
+                enabled = self.behavior_var.get() == OUTPUT_BEHAVIOR_LABELS[2] or (
+                    self.behavior_var.get() == OUTPUT_BEHAVIOR_LABELS[0] and input_event != cm.INPUT_WHILE_ACTIVE)
+                click_ms = int(self.click_ms_var.get()) if enabled else 0
+                if not 0 <= click_ms <= 4095:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid click duration", "Click duration must be 0-4095 ms (0 uses the global tap duration).", parent=self)
+                return
         if self.edit_hold_timing and action_type != cm.ACTION_NONE:
             mode = self.hold_timing_var.get()
             if mode == HOLD_TIMING_LABELS[0]:
@@ -405,10 +660,40 @@ class ActionDialog(tk.Toplevel):
                         parent=self,
                     )
                     return
+        if self.edit_combo_delay and action_type != cm.ACTION_NONE:
+            try:
+                duration_ms = int(self.combo_delay_var.get())
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid combo delay",
+                    "Activation delay must be a whole number from 0 to 65535 ms.",
+                    parent=self,
+                )
+                return
+            if not 0 <= duration_ms <= 0xFFFF:
+                messagebox.showerror(
+                    "Invalid combo delay",
+                    "Activation delay must be between 0 and 65535 ms.",
+                    parent=self,
+                )
+                return
+        if input_event == cm.INPUT_CLICK and (
+            (self.edit_combo_delay and duration_ms != 0) or
+            (self.edit_hold_timing and duration_ms != 1)
+        ):
+            messagebox.showerror("Click input requires immediate activation",
+                                 "Choose While pressed activation, or set combo activation delay to 0, for a short Click input.", parent=self)
+            return
         if action_type == cm.ACTION_NONE:
             self.result = cm.Action(type=cm.ACTION_NONE)
         elif action_type == cm.ACTION_KEY:
             self.result = cm.Action(type=cm.ACTION_KEY, param1=self.key_var.get())
+        elif action_type == cm.ACTION_TWO_KEYS:
+            self.result = cm.Action(
+                type=cm.ACTION_TWO_KEYS,
+                param1=self.first_key_var.get(),
+                param2=self.second_key_var.get(),
+            )
         elif action_type == cm.ACTION_MODIFIER_KEY:
             self.result = cm.Action(
                 type=cm.ACTION_MODIFIER_KEY,
@@ -434,13 +719,26 @@ class ActionDialog(tk.Toplevel):
         ):
             self.result = cm.Action(type=action_type)
         elif action_type == cm.ACTION_MACRO:
+            mode_index = MACRO_BINDING_TRIGGER_LABELS.index(self.macro_trigger_var.get())
             self.result = cm.Action(
                 type=cm.ACTION_MACRO,
                 param1=self.macro_index.get(),
-                trigger_mode=self.trigger_var.get(),
+                trigger_mode=(cm.MACRO_TRIGGER_OVERRIDE | (mode_index - 1)) if mode_index else 0,
             )
-        if self.edit_hold_timing and self.result is not None and self.result.type != cm.ACTION_NONE:
+        elif action_type == cm.ACTION_STOP_ALL:
+            self.result = cm.Action(type=cm.ACTION_STOP_ALL)
+        elif action_type == cm.ACTION_MOUSE_MODE_TOGGLE_KEY:
+            self.result = cm.Action(
+                type=cm.ACTION_MOUSE_MODE_TOGGLE_KEY,
+                param1=self.mouse_mode_key_var.get(),
+            )
+        elif action_type == cm.ACTION_MOUSE_MODE_SWAP:
+            self.result = cm.Action(type=cm.ACTION_MOUSE_MODE_SWAP)
+        if self.result is not None and self.result.type != cm.ACTION_NONE:
             self.result.duration_ms = duration_ms
+            self.result.value = cm.action_behavior_value(input_event, click_ms)
+            if self.result.type in cm.TOGGLE_ACTION_TYPES:
+                self.result.trigger_mode = OUTPUT_BEHAVIOR_MODES[OUTPUT_BEHAVIOR_LABELS.index(self.behavior_var.get())]
         self.destroy()
 
 
@@ -514,10 +812,19 @@ class ComboDialog(tk.Toplevel):
             self.suppress_vars[source].set(self.source_vars[source].get())
 
     def _refresh_action(self) -> None:
-        self.action_var.set(cm.format_action(self.action))
+        text = cm.format_action(self.action)
+        if self.action.duration_ms:
+            text = f"After {self.action.duration_ms} ms, hold: {text}"
+        self.action_var.set(text)
 
     def _change_action(self) -> None:
-        dialog = ActionDialog(self, "Combo output", self.action, self.macro_names)
+        dialog = ActionDialog(
+            self,
+            "Combo output",
+            self.action,
+            self.macro_names,
+            edit_combo_delay=True,
+        )
         self.wait_window(dialog)
         if dialog.result is not None:
             self.action = dialog.result
@@ -583,7 +890,7 @@ class StickSettingsDialog(tk.Toplevel):
 
         fields = [
             ("left_deadzone", "Left radial deadzone (0.0-<1.0; all profiles)", settings.left_deadzone),
-            ("right_deadzone", "Right per-axis deadzone (0.0-<1.0; all profiles)", settings.right_deadzone),
+            ("right_deadzone", "Mouse mode 1 right deadzone (0.0-<1.0; all profiles)", settings.mouse_mode_deadzone[0]),
             ("mouse_speed_x", "Right-stick base X speed (counts/s at DPI 1000)", settings.mouse_speed_x[profile]),
             ("mouse_speed_y", "Right-stick base Y speed (counts/s at DPI 1000)", settings.mouse_speed_y[profile]),
             ("right_center_x", "Right raw center X (0-4095; all profiles)", settings.right_center_x),
@@ -592,8 +899,8 @@ class StickSettingsDialog(tk.Toplevel):
         if profile == 1:
             fields.extend(
                 [
-                    ("profile2_rb_speed_x", "While-RB base X speed (counts/s at DPI 1000)", settings.profile2_rb_speed_x),
-                    ("profile2_rb_speed_y", "While-RB base Y speed (counts/s at DPI 1000)", settings.profile2_rb_speed_y),
+                    ("profile2_rb_speed_x", "ADS base X speed (counts/s at DPI 1000)", settings.profile2_rb_speed_x),
+                    ("profile2_rb_speed_y", "ADS base Y speed (counts/s at DPI 1000)", settings.profile2_rb_speed_y),
                     (
                         "profile2_outer_threshold_percent",
                         "Outer-ring threshold (1-100%)",
@@ -601,18 +908,18 @@ class StickSettingsDialog(tk.Toplevel):
                     ),
                     (
                         "profile2_no_rb_ramp_ms",
-                        "No-RB outer acceleration ramp (ms)",
+                        "Hip-fire outer acceleration ramp (ms)",
                         settings.profile2_no_rb_ramp_ms,
                     ),
                     (
                         "profile2_no_rb_extra_x",
-                        "No-RB extra X speed (base counts/s)",
+                        "Hip-fire extra X speed (base counts/s)",
                         settings.profile2_no_rb_extra_x,
                     ),
-                    ("profile2_rb_delay_ms", "RB acceleration delay (ms)", settings.profile2_rb_delay_ms),
-                    ("profile2_rb_ramp_ms", "RB acceleration ramp (ms)", settings.profile2_rb_ramp_ms),
-                    ("profile2_rb_extra_x", "RB extra X speed (base counts/s)", settings.profile2_rb_extra_x),
-                    ("profile2_rb_extra_y", "RB extra Y speed (base counts/s)", settings.profile2_rb_extra_y),
+                    ("profile2_rb_delay_ms", "ADS acceleration delay (ms)", settings.profile2_rb_delay_ms),
+                    ("profile2_rb_ramp_ms", "ADS acceleration ramp (ms)", settings.profile2_rb_ramp_ms),
+                    ("profile2_rb_extra_x", "ADS extra X speed (base counts/s)", settings.profile2_rb_extra_x),
+                    ("profile2_rb_extra_y", "ADS extra Y speed (base counts/s)", settings.profile2_rb_extra_y),
                 ]
             )
 
@@ -626,6 +933,23 @@ class StickSettingsDialog(tk.Toplevel):
 
         next_row = len(fields) + 1
         if profile == 1:
+            self.aim_source_var = tk.StringVar(value=cm.SOURCE_NAMES[settings.profile2_aim_source])
+            ttk.Label(body, text="Aim / ADS input (while pressed)").grid(
+                row=next_row, column=0, sticky="w", pady=3
+            )
+            ttk.Combobox(
+                body, textvariable=self.aim_source_var, state="readonly",
+                values=cm.SOURCE_NAMES, width=28,
+            ).grid(row=next_row, column=1, sticky="ew", padx=8, pady=3)
+            next_row += 1
+            ttk.Label(
+                body,
+                text=("Hold this input to use ADS speeds and acceleration; release it to "
+                      "use hip-fire settings. Choose the same input you use to aim in game. "
+                      "Changing it from RB requires firmware 2.4.0 or newer."),
+                wraplength=520,
+            ).grid(row=next_row, column=0, columnspan=2, sticky="w", pady=(3, 6))
+            next_row += 1
             self.accel_var = tk.BooleanVar(value=bool(settings.profile2_accel_enabled))
             ttk.Checkbutton(
                 body, text="Enable Profile 2 outer-ring acceleration", variable=self.accel_var
@@ -656,11 +980,13 @@ class StickSettingsDialog(tk.Toplevel):
             settings.left_stick_mode[self.profile] = self.MODE_LABELS.index(self.mode_var.get())
             settings.left_deadzone = float(self.vars["left_deadzone"].get())
             settings.right_deadzone = float(self.vars["right_deadzone"].get())
+            settings.mouse_mode_deadzone[0] = settings.right_deadzone
             settings.mouse_speed_x[self.profile] = int(self.vars["mouse_speed_x"].get())
             settings.mouse_speed_y[self.profile] = int(self.vars["mouse_speed_y"].get())
             settings.right_center_x = int(self.vars["right_center_x"].get())
             settings.right_center_y = int(self.vars["right_center_y"].get())
             if self.profile == 1:
+                settings.profile2_aim_source = cm.SOURCE_NAMES.index(self.aim_source_var.get())
                 for key in (
                     "profile2_rb_speed_x",
                     "profile2_rb_speed_y",
@@ -684,7 +1010,7 @@ class StickSettingsDialog(tk.Toplevel):
 
 
 class MacroStepDialog(tk.Toplevel):
-    TYPE_LABELS = ("Delay", "Keyboard state", "Mouse state")
+    TYPE_LABELS = tuple(cm.MACRO_STEP_NAMES.values())
 
     def __init__(self, parent: tk.Misc, initial: cm.MacroStep):
         super().__init__(parent)
@@ -698,6 +1024,16 @@ class MacroStepDialog(tk.Toplevel):
         }
         initial_keys = list(initial.keys[:6]) + [0] * 6
         self.key_vars = [tk.IntVar(value=initial_keys[index]) for index in range(6)]
+        self.special_key_var = tk.IntVar(
+            value=initial_keys[0]
+            if initial.type == cm.MACRO_STEP_MOUSE_MODE_TOGGLE_KEY
+            else cm.HID_NAME_TO_KEY["Tab"]
+        )
+        self.key_names = ["(none)"] + [
+            f"0x{code:02X} {name}"
+            for code, name in sorted(cm.HID_KEY_NAMES.items())
+            if code
+        ]
         buttons = initial.keys[0] if initial.keys else 0
         self.mouse_button_vars = {
             cm.MOUSE_LEFT: tk.BooleanVar(value=bool(buttons & cm.MOUSE_LEFT)),
@@ -718,7 +1054,7 @@ class MacroStepDialog(tk.Toplevel):
         )
         type_box.grid(row=0, column=1, sticky="ew", padx=6)
         type_box.bind("<<ComboboxSelected>>", lambda _event: self._refresh())
-        ttk.Label(body, text="Duration (ms)").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Label(body, text="Time before next step (ms)").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(body, textvariable=self.duration_var, width=26).grid(
             row=1, column=1, sticky="ew", padx=6, pady=4
         )
@@ -740,7 +1076,7 @@ class MacroStepDialog(tk.Toplevel):
             widget.destroy()
         step_type = self.TYPE_LABELS.index(self.type_var.get())
         if step_type == cm.MACRO_STEP_DELAY:
-            ttk.Label(self.dynamic, text="No output; wait for the duration above.").grid(
+            ttk.Label(self.dynamic, text="Wait while preserving the current keyboard and mouse-button state.").grid(
                 row=0, column=0, sticky="w"
             )
         elif step_type == cm.MACRO_STEP_KEYBOARD:
@@ -750,14 +1086,13 @@ class MacroStepDialog(tk.Toplevel):
                 ttk.Checkbutton(mods, text=name, variable=self.modifier_vars[bit]).grid(
                     row=index // 4, column=index % 4, sticky="w", padx=3
                 )
-            values = ["(none)"] + [
-                f"0x{code:02X} {name}" for code, name in sorted(cm.HID_KEY_NAMES.items()) if code
-            ]
             for index, variable in enumerate(self.key_vars):
                 ttk.Label(self.dynamic, text=f"Key {index + 1}").grid(
                     row=index + 1, column=0, sticky="w", pady=2
                 )
-                box = ttk.Combobox(self.dynamic, state="readonly", values=values, width=25)
+                box = ttk.Combobox(
+                    self.dynamic, state="readonly", values=self.key_names, width=31
+                )
                 box.grid(row=index + 1, column=1, sticky="ew", pady=2)
                 ActionDialog._set_key_combo(variable, box)
                 box.bind(
@@ -766,7 +1101,7 @@ class MacroStepDialog(tk.Toplevel):
                         var, widget.get()
                     ),
                 )
-        else:
+        elif step_type == cm.MACRO_STEP_MOUSE:
             ttk.Label(self.dynamic, text="Buttons").grid(row=0, column=0, sticky="w")
             button_frame = ttk.Frame(self.dynamic)
             button_frame.grid(row=0, column=1, sticky="w")
@@ -786,6 +1121,47 @@ class MacroStepDialog(tk.Toplevel):
                 ttk.Entry(self.dynamic, textvariable=variable, width=26).grid(
                     row=row, column=1, sticky="ew", pady=2
                 )
+        elif step_type in (
+            cm.MACRO_STEP_WHEEL_UP_TURBO,
+            cm.MACRO_STEP_WHEEL_DOWN_TURBO,
+            cm.MACRO_STEP_WHEEL_UP_COMBO,
+            cm.MACRO_STEP_WHEEL_DOWN_COMBO,
+        ):
+            ttk.Label(
+                self.dynamic,
+                text=(
+                    "Repeats wheel ticks for the duration above using the matching "
+                    "turbo/combo rate from Settings."
+                ),
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+        elif step_type == cm.MACRO_STEP_ALT_TAP_KEY:
+            ttk.Label(
+                self.dynamic,
+                text="Outputs 1 and 2 alternately each time this step runs.",
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
+        elif step_type == cm.MACRO_STEP_MOUSE_MODE_TOGGLE_KEY:
+            ttk.Label(self.dynamic, text="Key to send (optional)").grid(
+                row=0, column=0, sticky="w", pady=3
+            )
+            box = ttk.Combobox(
+                self.dynamic, state="readonly", values=self.key_names, width=31
+            )
+            box.grid(row=0, column=1, sticky="ew", pady=3)
+            ActionDialog._set_key_combo(self.special_key_var, box)
+            box.bind(
+                "<<ComboboxSelected>>",
+                lambda _event, widget=box: ActionDialog._set_key_from_label(
+                    self.special_key_var, widget.get()
+                ),
+            )
+        elif step_type == cm.MACRO_STEP_MOUSE_MODE_SWAP:
+            ttk.Label(
+                self.dynamic,
+                text="Swaps mouse mode 1/2 order, then waits for the duration above.",
+                wraplength=440,
+            ).grid(row=0, column=0, columnspan=2, sticky="w")
 
     def _ok(self) -> None:
         try:
@@ -803,7 +1179,7 @@ class MacroStepDialog(tk.Toplevel):
                     keys=tuple(variable.get() for variable in self.key_vars),
                     duration_ms=duration,
                 )
-            else:
+            elif step_type == cm.MACRO_STEP_MOUSE:
                 dx = int(self.dx_var.get())
                 dy = int(self.dy_var.get())
                 wheel = int(self.wheel_var.get())
@@ -820,6 +1196,14 @@ class MacroStepDialog(tk.Toplevel):
                     value=wheel,
                     duration_ms=duration,
                 )
+            elif step_type == cm.MACRO_STEP_MOUSE_MODE_TOGGLE_KEY:
+                step = cm.MacroStep(
+                    type=step_type,
+                    keys=(self.special_key_var.get(), 0, 0, 0, 0, 0),
+                    duration_ms=duration,
+                )
+            else:
+                step = cm.MacroStep(type=step_type, duration_ms=duration)
         except (ValueError, TypeError) as exc:
             messagebox.showerror("Invalid macro step", str(exc), parent=self)
             return
@@ -1038,6 +1422,19 @@ class BindingsTab(ttk.Frame):
         )
         self.wait_window(dialog)
         if dialog.result is not None:
+            if (
+                gesture_index == cm.GESTURE_TAP
+                and dialog.result.type == cm.ACTION_MOUSE_MODE_TOGGLE_KEY
+            ):
+                install_mouse_mode_binding(
+                    self.app.config, profile, source, dialog.result.param1
+                )
+                self.app.status_var.set(
+                    f"{cm.SOURCE_NAMES[source]} now toggles mouse modes on Tap; "
+                    "Hold was cleared and Double tap now swaps modes."
+                )
+                self.refresh()
+                return
             self.app.config.bindings[profile][source][gesture_index] = dialog.result
             self.refresh()
 
@@ -1067,7 +1464,10 @@ class BindingsTab(ttk.Frame):
             None,
         )
         if slot is None:
-            messagebox.showwarning("No free combo slot", "All 16 combo slots are in use.")
+            messagebox.showwarning(
+                "No free combo slot",
+                f"All {cm.COMBO_MAX} combo slots are in use.",
+            )
             return
         initial = cm.Combo(profile_mask=1 << self._profile())
         self._show_combo_dialog(slot, initial)
@@ -1162,11 +1562,17 @@ class MacrosTab(ttk.Frame):
         ttk.Label(row1, text="Name").pack(side="left")
         self.name_var = tk.StringVar(value="")
         ttk.Entry(row1, textvariable=self.name_var, width=32).pack(side="left", padx=6)
-        ttk.Label(row1, text="Trigger").pack(side="left", padx=(12, 0))
+        ttk.Label(row1, text="Default playback").pack(side="left", padx=(12, 0))
         self.trigger_var = tk.StringVar(value=cm.MACRO_TRIGGER_NAMES[0])
         trigger_box = ttk.Combobox(row1, textvariable=self.trigger_var, state="readonly",
                                    values=cm.MACRO_TRIGGER_NAMES, width=14)
         trigger_box.pack(side="left", padx=6)
+        ttk.Label(right,
+            text=("Keyboard/mouse steps set their device's pressed state until the next step for that device or macro end. "
+                  "Delay preserves it. For clicks, insert a release step after the press. "
+                  "While held repeats; Toggle repeats until activated again. Bindings can override this default. "
+                  "Other held keys/buttons remain active; keyboard output has a six-key limit."),
+            wraplength=760).pack(fill="x", pady=(6, 0))
 
         step_buttons = ttk.Frame(right)
         step_buttons.pack(fill="x", pady=(8, 2))
@@ -1181,6 +1587,12 @@ class MacrosTab(ttk.Frame):
         ttk.Button(step_buttons, text="Move down", command=lambda: self._move_step(1)).pack(
             side="left"
         )
+        release_buttons = ttk.Frame(right)
+        release_buttons.pack(fill="x", pady=(2, 4))
+        ttk.Button(release_buttons, text="Insert keyboard release",
+                   command=lambda: self._insert_release(cm.MACRO_STEP_KEYBOARD)).pack(side="left")
+        ttk.Button(release_buttons, text="Insert mouse release",
+                   command=lambda: self._insert_release(cm.MACRO_STEP_MOUSE)).pack(side="left", padx=4)
         step_table = ttk.Frame(right)
         step_table.pack(fill="both", expand=True, pady=(0, 8))
         self.steps_tree = ttk.Treeview(
@@ -1286,6 +1698,22 @@ class MacrosTab(ttk.Frame):
         selected = self._selected_step_index()
         insert_at = macro.step_count if selected is None else selected + 1
         macro.steps.insert(insert_at, dialog.result)
+        macro.step_count = len(macro.steps)
+        self._render_steps(macro)
+        self.steps_tree.selection_set(str(insert_at))
+        self._refresh_overview()
+
+    def _insert_release(self, step_type: int) -> None:
+        self._commit_editor(self.selected_index.get())
+        macro = self._selected_macro()
+        if macro is None:
+            return
+        if macro.step_count >= cm.MACRO_STEP_MAX:
+            messagebox.showwarning("Macro full", f"A macro can contain at most {cm.MACRO_STEP_MAX} steps.")
+            return
+        selected = self._selected_step_index()
+        insert_at = macro.step_count if selected is None else selected + 1
+        macro.steps.insert(insert_at, cm.MacroStep(type=step_type, duration_ms=10))
         macro.step_count = len(macro.steps)
         self._render_steps(macro)
         self.steps_tree.selection_set(str(insert_at))
@@ -1467,15 +1895,18 @@ class SettingsTab(ttk.Frame):
             ("left_mode_3", "Profile 3 left-stick mode", "How the left stick becomes WASD in Profile 3."),
             ("active_profile", "Active profile", "Selects the profile the board uses now."),
             ("output_enabled", "Keyboard/mouse output", "Master switch; Disabled releases and stops mapped output."),
-            ("tap_ms", "Tap output duration (ms)", "How long a Tap action stays pressed; 1-60000 ms."),
-            ("hold_ms", "Hold activation threshold (ms)", "Default time before a Hold action starts; 1-60000 ms."),
+            ("tap_ms", "Default click / Tap duration (ms)", "Tap/Double output pulse and default Click duration; 1-60000 ms. Per-action Click can override this."),
+            ("hold_ms", "Hold / short-click threshold (ms)", "Default Hold delay and maximum duration for a short Click input; 1-60000 ms."),
             ("double_ms", "Double-click window (ms)", "Maximum gap used to recognize a double tap; 1-60000 ms."),
             ("turbo_hz", "Turbo wheel rate (events/s)", "Repeat rate for Wheel Up/Down Turbo actions; 1-1000."),
             ("combo_hz", "Combo wheel rate (events/s)", "Repeat rate for Wheel Up/Down Combo actions; 1-1000."),
-            ("grace_ms", "Mouse-button release grace (ms)", "Holds any mapped mouse button through brief report gaps; 0-5000 ms."),
+            ("grace_ms", "Mouse-button release grace (ms)", "Filters brief input drops; 0-5000 ms. Explicit Click/Toggle releases and suppression bypass it."),
             ("left_dz", "Left radial deadzone (all profiles)", "Ignores total left-stick magnitude below this value; 0.0-<1.0."),
-            ("right_dz", "Right per-axis deadzone (all profiles)", "Ignores each right-stick axis below this value; 0.0-<1.0."),
             ("virtual_dpi", "Virtual DPI (all profiles)", "Global count multiplier, 100-20000; 1000 preserves legacy speed."),
+            ("mouse_mode_sens_1", "Mouse mode 1 sensitivity (%)", "Multiplier applied after profile speed and virtual DPI; 1-1000%."),
+            ("mouse_mode_dz_1", "Mouse mode 1 right deadzone", "Right-stick per-axis deadzone while mode 1 is active; 0.0-<1.0."),
+            ("mouse_mode_sens_2", "Mouse mode 2 sensitivity (%)", "Multiplier applied after profile speed and virtual DPI; 1-1000%."),
+            ("mouse_mode_dz_2", "Mouse mode 2 right deadzone", "Right-stick per-axis deadzone while mode 2 is active; 0.0-<1.0."),
             ("speed_x_1", "Profile 1 base X speed", "Full-stick horizontal counts/s before the DPI multiplier; 0-65535."),
             ("speed_y_1", "Profile 1 base Y speed", "Full-stick vertical counts/s before the DPI multiplier; 0-65535."),
             ("speed_x_2", "Profile 2 base X speed", "Full-stick horizontal counts/s before the DPI multiplier; 0-65535."),
@@ -1610,7 +2041,8 @@ class SettingsTab(ttk.Frame):
         settings.right_center_x = status.center_x
         settings.right_center_y = status.center_y
         settings.right_deadzone = status.deadzone
-        self.vars["right_dz"].set(f"{status.deadzone:.6f}")
+        settings.mouse_mode_deadzone[0] = status.deadzone
+        self.vars["mouse_mode_dz_1"].set(f"{status.deadzone:.6f}")
         self.calibration_button.configure(state="normal")
         self.calibration_var.set(
             f"Done: center {status.center_x}/{status.center_y}, "
@@ -1647,8 +2079,11 @@ class SettingsTab(ttk.Frame):
         self.vars["combo_hz"].set(str(settings.wheel_combo_hz))
         self.vars["grace_ms"].set(str(settings.mouse_release_grace_ms))
         self.vars["left_dz"].set(str(settings.left_deadzone))
-        self.vars["right_dz"].set(str(settings.right_deadzone))
         self.vars["virtual_dpi"].set(str(settings.virtual_dpi))
+        self.vars["mouse_mode_sens_1"].set(str(settings.mouse_mode_sensitivity[0]))
+        self.vars["mouse_mode_dz_1"].set(str(settings.mouse_mode_deadzone[0]))
+        self.vars["mouse_mode_sens_2"].set(str(settings.mouse_mode_sensitivity[1]))
+        self.vars["mouse_mode_dz_2"].set(str(settings.mouse_mode_deadzone[1]))
         self.vars["speed_x_1"].set(str(settings.mouse_speed_x[0]))
         self.vars["speed_y_1"].set(str(settings.mouse_speed_y[0]))
         self.vars["speed_x_2"].set(str(settings.mouse_speed_x[1]))
@@ -1682,8 +2117,12 @@ class SettingsTab(ttk.Frame):
         settings.wheel_combo_hz = int(self.vars["combo_hz"].get())
         settings.mouse_release_grace_ms = int(self.vars["grace_ms"].get())
         settings.left_deadzone = float(self.vars["left_dz"].get())
-        settings.right_deadzone = float(self.vars["right_dz"].get())
         settings.virtual_dpi = int(self.vars["virtual_dpi"].get())
+        settings.mouse_mode_sensitivity[0] = int(self.vars["mouse_mode_sens_1"].get())
+        settings.mouse_mode_deadzone[0] = float(self.vars["mouse_mode_dz_1"].get())
+        settings.right_deadzone = settings.mouse_mode_deadzone[0]
+        settings.mouse_mode_sensitivity[1] = int(self.vars["mouse_mode_sens_2"].get())
+        settings.mouse_mode_deadzone[1] = float(self.vars["mouse_mode_dz_2"].get())
         settings.mouse_speed_x[0] = int(self.vars["speed_x_1"].get())
         settings.mouse_speed_y[0] = int(self.vars["speed_y_1"].get())
         settings.mouse_speed_x[1] = int(self.vars["speed_x_2"].get())
@@ -1861,6 +2300,8 @@ class App(tk.Tk):
         ttk.Button(bar, text="Read from board", command=self.read_board).pack(side="left", padx=4)
         ttk.Button(bar, text="Apply live", command=self.apply_live).pack(side="left", padx=4)
         ttk.Button(bar, text="Save to board", command=self.save_board).pack(side="left", padx=4)
+        ttk.Button(bar, text="Export JSON", command=self.export_json).pack(side="left", padx=4)
+        ttk.Button(bar, text="Import JSON", command=self.import_json).pack(side="left", padx=4)
         ttk.Button(bar, text="Factory reset", command=self.factory_reset).pack(side="right", padx=4)
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(bar, textvariable=self.status_var).pack(side="right", padx=12)
@@ -1969,6 +2410,14 @@ class App(tk.Tk):
         if self.connection is None or self.config is None:
             raise RuntimeError("No verified board connection.")
 
+    def _commit_local_editors(self) -> None:
+        if self.config is None:
+            raise RuntimeError("No configuration is loaded.")
+        self.settings_tab.apply_to_config()
+        self.macros_tab._save_selected_fields()
+        cm.validate_config(self.config)
+        self.bindings_tab.refresh()
+
     def read_board(self) -> None:
         try:
             self._require_connection()
@@ -1982,10 +2431,87 @@ class App(tk.Tk):
             messagebox.showerror("Read failed", str(exc))
 
     def _collect_local_config(self) -> bytes:
-        self.settings_tab.apply_to_config()
-        self.macros_tab._save_selected_fields()
-        self.bindings_tab.refresh()
+        self._commit_local_editors()
+        identity = self.connection.identity if self.connection is not None else None
+        firmware_version = (
+            identity.firmware_major,
+            identity.firmware_minor,
+            identity.firmware_patch,
+        ) if identity is not None else (0, 0, 0)
+        if config_uses_toggle_options(self.config) and firmware_version < (2, 5, 0):
+            raise RuntimeError(
+                "Input events, output states, per-binding macro playback and Stop require firmware 2.5.0 or newer. "
+                "Flash the stable UF2 bundled with this installer first."
+            )
+        if self.config.settings.profile2_aim_source != cm.SRC_RB and firmware_version < (2, 4, 0):
+            raise RuntimeError(
+                "A configurable Aim / ADS input requires firmware 2.4.0 or newer. "
+                "Flash the stable UF2 bundled with this installer first."
+            )
+        if config_uses_delayed_combos(self.config) and firmware_version < (2, 1, 0):
+            raise RuntimeError(
+                "Delayed combo actions require firmware 2.1.0 or newer. "
+                "Flash the stable UF2 bundled with this installer first."
+            )
+        if config_uses_mouse_mode_actions(self.config) and firmware_version < (2, 2, 0):
+            raise RuntimeError(
+                "Dual mouse-mode actions require firmware 2.2.0 or newer. "
+                "Flash the stable UF2 bundled with this installer first."
+            )
+        if (
+            config_uses_two_key_actions(self.config)
+            or config_uses_extended_macro_steps(self.config)
+        ) and firmware_version < (2, 3, 0):
+            raise RuntimeError(
+                "Two-key bindings and extended macro steps require firmware "
+                "2.3.0 or newer. "
+                "Flash the stable UF2 bundled with this installer first."
+            )
         return cm.encode_payload(self.config)
+
+    def export_json(self) -> None:
+        try:
+            self._commit_local_editors()
+            document = cm.config_to_json_document(
+                self.config, app_version=__version__
+            )
+            filename = filedialog.asksaveasfilename(
+                title="Export configuration JSON",
+                defaultextension=".json",
+                initialfile="PicoController2MNK-config.json",
+                filetypes=[("JSON configuration", "*.json"), ("All files", "*.*")],
+            )
+            if not filename:
+                return
+            Path(filename).write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            self.status_var.set(f"Configuration exported to {filename}.")
+        except Exception as exc:
+            self.status_var.set(str(exc))
+            messagebox.showerror("Export failed", str(exc))
+
+    def import_json(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Import configuration JSON",
+            filetypes=[("JSON configuration", "*.json"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+        try:
+            document = json.loads(Path(filename).read_text(encoding="utf-8-sig"))
+            imported = cm.config_from_json_document(document)
+            self.config = imported
+            self.bindings_tab.refresh()
+            self.macros_tab.refresh()
+            self.settings_tab.refresh()
+            self.status_var.set(
+                f"Imported {filename} locally. Use Apply live or Save to board to send it."
+            )
+        except Exception as exc:
+            self.status_var.set(str(exc))
+            messagebox.showerror("Import failed", str(exc))
 
     def apply_live(self) -> None:
         try:

@@ -67,6 +67,42 @@ class FirmwareSourceInvariantTests(unittest.TestCase):
             body.index("uint64_t now_us = time_us_64()"),
         )
 
+    def test_combo_delay_waits_then_releases_with_combo(self) -> None:
+        action_source = (ROOT / "mapper_action.c").read_text(encoding="utf-8")
+        body = function_body(action_source, "static void apply_combo_action(")
+
+        self.assertIn("runtime->combo_delay_start_us = 0", body)
+        self.assertIn("action->duration_ms == 0", body)
+        self.assertIn("(uint64_t)action->duration_ms * 1000u", body)
+        self.assertIn("apply_action(action, runtime, delay_elapsed", body)
+
+    def test_store_keeps_legacy_config_migration_path(self) -> None:
+        config_header = (ROOT / "mapper_config.h").read_text(encoding="utf-8")
+        store_source = (ROOT / "mapper_store.c").read_text(encoding="utf-8")
+
+        self.assertIn("#define MAPPER_COMBO_MAX 64u", config_header)
+        self.assertIn("mapper_config_apply_legacy_payload", store_source)
+        self.assertIn("store_legacy_slot_offset", store_source)
+        self.assertIn("(2u * MAPPER_STORE_LEGACY_SLOT_SIZE)", store_source)
+
+    def test_two_key_action_adds_both_keycodes(self) -> None:
+        action_source = (ROOT / "mapper_action.c").read_text(encoding="utf-8")
+        body = function_body(action_source, "static void apply_action(")
+
+        self.assertIn("case MAPPER_ACTION_TWO_KEYS:", body)
+        self.assertIn("builder_add_keycode(keyboard, action->param1);", body)
+        self.assertIn("builder_add_keycode(keyboard, action->param2);", body)
+
+    def test_extended_macro_steps_include_binding_outputs(self) -> None:
+        action_source = (ROOT / "mapper_action.c").read_text(encoding="utf-8")
+        body = function_body(action_source, "static void macro_task(")
+
+        self.assertIn("MAPPER_MACRO_STEP_WHEEL_UP_TURBO", body)
+        self.assertIn("MAPPER_MACRO_STEP_ALT_TAP_KEY", body)
+        self.assertIn("MAPPER_MACRO_STEP_MOUSE_MODE_TOGGLE_KEY", body)
+        self.assertIn("MAPPER_MACRO_STEP_MOUSE_MODE_SWAP", body)
+        self.assertIn("g_mouse_mode_secondary = !g_mouse_mode_secondary", body)
+
 
 if __name__ == "__main__":
     unittest.main()

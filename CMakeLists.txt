@@ -2,17 +2,17 @@ cmake_minimum_required(VERSION 3.13)
 
 include(pico_sdk_import.cmake)
 
-project(PicoController2MNK C CXX ASM)
+project(pico_cdc_test C CXX ASM)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
 set(PICO_PIO_USB_PATH "${CMAKE_CURRENT_LIST_DIR}/Pico-PIO-USB" CACHE PATH "Pico-PIO-USB path")
 
-# Reserve the final two 8 KiB sectors for mapper_store.c. The board header
+# Reserve the final two 12 KiB slots for mapper_store.c. The board header
 # still exposes the physical 2 MiB size to the firmware, while the linker
 # fails the build if code/data ever grows into the persistent config slots.
-set(PICO_FLASH_SIZE_BYTES "(2 * 1024 * 1024) - (2 * 8192)")
+set(PICO_FLASH_SIZE_BYTES "(2 * 1024 * 1024) - (2 * 12288)")
 
 pico_sdk_init()
 
@@ -55,8 +55,8 @@ target_compile_definitions(pico_kbm_mapper PRIVATE
     KEYMOUSE_REPORT_RATE_HZ=8000
     FIRMWARE_PID=0x4007
     FIRMWARE_VERSION_MAJOR=2
-    FIRMWARE_VERSION_MINOR=0
-    FIRMWARE_VERSION_PATCH=6
+    FIRMWARE_VERSION_MINOR=5
+    FIRMWARE_VERSION_PATCH=0
 
     "FIRMWARE_PRODUCT_STRING=\"Pico KBM Mapper\""
 )
@@ -73,8 +73,8 @@ target_compile_definitions(pico_kbm_mapper_trace PRIVATE
     KEYMOUSE_REPORT_RATE_HZ=8000
     FIRMWARE_PID=0x4008
     FIRMWARE_VERSION_MAJOR=2
-    FIRMWARE_VERSION_MINOR=0
-    FIRMWARE_VERSION_PATCH=6
+    FIRMWARE_VERSION_MINOR=5
+    FIRMWARE_VERSION_PATCH=0
 
     "FIRMWARE_PRODUCT_STRING=\"Pico KBM Mapper Trace\""
 )

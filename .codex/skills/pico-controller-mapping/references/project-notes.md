@@ -62,7 +62,7 @@ The mapper firmware carries multiple profiles in one UF2:
 Current profile intent:
 
 - Profile 1: baseline mapping; X tap `R`, hold `F`.
-- Profile 2: alternate movement/action layout; left stick uses stable 4-way WASD with changed-only keyboard reports, not PWM/key pulsing; right-stick speed is X/Y `5000/4166` normally and `3750/2000` while RB is held; no-RB outer-ring adds up to `+4583` X speed after `0.3s`, RB outer-ring waits `0.25s` then ramps up to `+625/+625` X/Y over `1.0s`; LT is Left Ctrl, RT is Space, Dpad-down is wheel-up turbo only unless LB is held, LB+Dpad-down maps to `H`, A is `V`, B is wheel-down turbo, X tap `R`/hold `E`, Option tap `ESC`/hold `M`, Lstick+Y combo `Z`, LB+B combo Left Shift, Rstick tap alternates `1`/`2` and hold is `3`.
+- Profile 2: alternate movement/action layout; left stick uses stable 4-way WASD with changed-only keyboard reports, not PWM/key pulsing; right-stick speed is X/Y `5000/4166` for hip fire and `3750/2000` while the configured Aim input is held (legacy default RB; firmware 2.4.0 allows LT or another logical input); hip-fire outer-ring adds up to `+4583` X speed after `0.3s`, ADS outer-ring waits `0.25s` then ramps up to `+625/+625` X/Y over `1.0s`; LT is Left Ctrl, RT is Space, Dpad-down is wheel-up turbo only unless LB is held, LB+Dpad-down maps to `H`, A is `V`, B is wheel-down turbo, X tap `R`/hold `E`, Option tap `ESC`/hold `M`, Lstick+Y combo `Z`, LB+B combo Left Shift, Rstick tap alternates `1`/`2` and hold is `3`.
 - Profile 3: alternate combat layout; X single-click `R`, double-click `F`, custom LT/RT behavior based on LB, LT+RT combo `X`, LB+B combo `U`.
 
 ## Mapping Patterns

@@ -8,8 +8,8 @@ extern "C" {
 #endif
 
 #define MAPPER_PROTOCOL_VERSION 1u
-#define MAPPER_PROTOCOL_SCHEMA_VERSION 1u
-#define MAPPER_PROTOCOL_MAX_PAYLOAD 8000u
+#define MAPPER_PROTOCOL_SCHEMA_VERSION 2u
+#define MAPPER_PROTOCOL_MAX_PAYLOAD 8816u
 
 void mapper_protocol_init(void);
 void mapper_protocol_task(void);

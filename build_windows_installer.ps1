@@ -157,7 +157,7 @@ try {
     Pop-Location
 }
 
-$installer = Join-Path $root "installer\PicoController2MNK-Setup-0.1.2.exe"
+$installer = Join-Path $root "installer\PicoController2MNK-Setup-0.2.4.exe"
 if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
     throw "Installer build completed without producing: $installer"
 }

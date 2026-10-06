@@ -50,6 +50,7 @@ extern void mapper_trace_mouse_output(
 #define MAPPER_HID_MOUSE_INSTANCE 1u
 #define GESTURE_PULSE_QUEUE_LEN 16u
 #define GESTURE_RELEASE_GAP_US 1000u
+#define ACTION_RUNTIME_COUNT (MAPPER_SOURCE_COUNT * MAPPER_GESTURE_COUNT + MAPPER_COMBO_MAX)
 
 typedef struct {
     uint8_t pressed;
@@ -74,16 +75,34 @@ typedef struct {
 
 typedef struct {
     bool active;
+    bool input_active;
+    uint64_t input_start_us;
+    bool output_active;
+    bool toggle_latched;
+    bool latch_registered;
     bool macro_toggle_latched;
+    uint8_t macro_trigger_mode;
+    bool release_requested;
+    bool click_pending;
+    bool click_release_pending;
+    uint8_t click_queue;
+    uint64_t click_until_us;
+    uint32_t click_duration_us;
     uint8_t alt_pending_key;
     uint8_t alt_next_key;
     uint64_t wheel_next_us;
+    uint64_t combo_delay_start_us;
 } action_runtime_t;
 
 static source_state_t g_source_states[MAPPER_SOURCE_COUNT];
 static action_runtime_t
     g_binding_runtimes[MAPPER_SOURCE_COUNT][MAPPER_GESTURE_COUNT];
 static action_runtime_t g_combo_runtimes[MAPPER_COMBO_MAX];
+static action_runtime_t *g_latched_runtimes[ACTION_RUNTIME_COUNT];
+static const mapper_action_t *g_latched_actions[ACTION_RUNTIME_COUNT];
+static uint8_t g_latched_count = 0;
+static bool g_release_latch_requested = false;
+static bool g_combo_suppressed_until_release[MAPPER_COMBO_MAX];
 static bool g_source_suppressed_until_release[MAPPER_SOURCE_COUNT];
 static uint8_t g_last_profile = 0xff;
 static bool g_neutral_pending = false;
@@ -109,16 +128,37 @@ static uint8_t g_mouse_forced_release_mask = 0;
 
 /* Profile 2 right-stick outer acceleration (preserves MAPPINGS.md behavior). */
 static bool g_profile2_outer_active = false;
-static bool g_profile2_outer_rb = false;
+static bool g_profile2_outer_aim = false;
 static uint64_t g_profile2_outer_start_us = 0;
+
+/* Two runtime mouse modes can be toggled without changing the active mapping
+ * profile. Swap flips their logical order so a missed game-menu transition can
+ * be re-synchronized without writing flash. */
+static bool g_mouse_mode_secondary = false;
+static bool g_mouse_modes_swapped = false;
+
+static uint8_t active_mouse_mode(void) {
+    return (uint8_t)(g_mouse_mode_secondary ^ g_mouse_modes_swapped);
+}
+
+static void mouse_mode_changed(void) {
+    g_mouse_accum_x = 0.0f;
+    g_mouse_accum_y = 0.0f;
+    g_profile2_outer_active = false;
+    g_profile2_outer_aim = false;
+    g_profile2_outer_start_us = 0;
+}
 
 /* Snapshot macro */
 static uint64_t g_snapshot_start_us = 0;
 static bool g_snapshot_active = false;
+static bool g_stop_all_requested = false;
+static bool g_click_needs_ack = false;
 
 /* Macro playback */
 static bool g_macro_active = false;
 static uint8_t g_macro_index = 0;
+static uint8_t g_macro_trigger_mode = MAPPER_MACRO_TRIGGER_PRESS;
 static uint8_t g_macro_step = 0;
 static uint64_t g_macro_next_step_us = 0;
 static uint64_t g_macro_step_duration_us = 0;
@@ -135,6 +175,12 @@ static uint8_t g_macro_mouse_buttons = 0;
 static int8_t g_macro_mouse_dx = 0;
 static int8_t g_macro_mouse_dy = 0;
 static int8_t g_macro_mouse_wheel = 0;
+static int8_t g_macro_wheel_direction = 0;
+static uint32_t g_macro_wheel_interval_us = 0;
+static uint64_t g_macro_wheel_next_us = 0;
+static uint8_t g_macro_alt_next_key = HID_KEY_1;
+static uint8_t g_expected_keyboard_modifier;
+static uint8_t g_expected_keyboard_keys[6];
 
 static float clampf(float value, float lo, float hi) {
     if (value < lo) return lo;
@@ -299,12 +345,17 @@ static void reset_source_states(void) {
     memset(g_source_states, 0, sizeof(g_source_states));
     memset(g_binding_runtimes, 0, sizeof(g_binding_runtimes));
     memset(g_combo_runtimes, 0, sizeof(g_combo_runtimes));
+    g_latched_count = 0;
+    g_release_latch_requested = false;
+    memset(g_combo_suppressed_until_release, 0, sizeof(g_combo_suppressed_until_release));
     memset(g_source_suppressed_until_release, 0,
            sizeof(g_source_suppressed_until_release));
     g_suppressed_sources = 0;
     g_mouse_forced_release_mask = 0;
     g_snapshot_active = false;
     g_snapshot_start_us = 0;
+    g_stop_all_requested = false;
+    g_click_needs_ack = false;
 }
 
 static void macro_stop(bool request_neutral) {
@@ -321,6 +372,9 @@ static void macro_stop(bool request_neutral) {
     g_macro_mouse_dx = 0;
     g_macro_mouse_dy = 0;
     g_macro_mouse_wheel = 0;
+    g_macro_wheel_direction = 0;
+    g_macro_wheel_interval_us = 0;
+    g_macro_wheel_next_us = 0;
     g_macro_needs_neutral = request_neutral;
     g_macro_keyboard_neutral_done = !request_neutral;
     g_macro_mouse_neutral_done = !request_neutral;
@@ -338,6 +392,7 @@ static void macro_start(uint8_t index, action_runtime_t *origin,
     macro_stop(false);
     g_macro_active = true;
     g_macro_index = index;
+    g_macro_trigger_mode = origin != NULL ? origin->macro_trigger_mode : MAPPER_MACRO_TRIGGER_PRESS;
     g_macro_step = 0;
     g_macro_next_step_us = now_us;
     g_macro_origin_runtime = origin;
@@ -354,9 +409,9 @@ static void macro_task(uint64_t now_us) {
         if (g_macro_step >= macro->step_count) {
             bool repeat = false;
             if (g_macro_origin_runtime != NULL) {
-                if (macro->trigger_mode == MAPPER_MACRO_TRIGGER_WHILE_HELD) {
+                if (g_macro_trigger_mode == MAPPER_MACRO_TRIGGER_WHILE_HELD) {
                     repeat = g_macro_origin_runtime->active;
-                } else if (macro->trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE) {
+                } else if (g_macro_trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE) {
                     repeat = g_macro_origin_runtime->macro_toggle_latched;
                 }
             }
@@ -377,6 +432,10 @@ static void macro_task(uint64_t now_us) {
 
         const mapper_macro_step_t *step = &macro->steps[g_macro_step];
 
+        g_macro_wheel_direction = 0;
+        g_macro_wheel_interval_us = 0;
+        g_macro_wheel_next_us = 0;
+
         if (step->type == MAPPER_MACRO_STEP_DELAY) {
             /* Delay is a timing operation; both device states stay held. */
         } else if (step->type == MAPPER_MACRO_STEP_KEYBOARD) {
@@ -389,6 +448,40 @@ static void macro_task(uint64_t now_us) {
             g_macro_mouse_dy = (int8_t)step->key[2];
             g_macro_mouse_wheel = step->value;
             g_macro_mouse_dirty = true;
+        } else if (step->type >= MAPPER_MACRO_STEP_WHEEL_UP_TURBO &&
+                   step->type <= MAPPER_MACRO_STEP_WHEEL_DOWN_COMBO) {
+            const mapper_settings_t *settings = &mapper_config_get()->settings;
+            bool up = step->type == MAPPER_MACRO_STEP_WHEEL_UP_TURBO ||
+                      step->type == MAPPER_MACRO_STEP_WHEEL_UP_COMBO;
+            bool turbo = step->type == MAPPER_MACRO_STEP_WHEEL_UP_TURBO ||
+                         step->type == MAPPER_MACRO_STEP_WHEEL_DOWN_TURBO;
+            uint32_t hz = turbo ? settings->wheel_turbo_hz
+                                : settings->wheel_combo_hz;
+            if (hz < 1) hz = 1;
+            if (hz > 1000) hz = 1000;
+            g_macro_wheel_direction = up ? 1 : -1;
+            g_macro_wheel_interval_us = 1000000u / hz;
+            g_macro_mouse_wheel = g_macro_wheel_direction;
+            g_macro_mouse_dirty = true;
+        } else if (step->type == MAPPER_MACRO_STEP_ALT_TAP_KEY) {
+            g_macro_key_modifier = 0;
+            memset(g_macro_keycode, 0, sizeof(g_macro_keycode));
+            g_macro_keycode[0] = g_macro_alt_next_key;
+            g_macro_alt_next_key =
+                g_macro_alt_next_key == HID_KEY_1 ? HID_KEY_2 : HID_KEY_1;
+            g_macro_keyboard_dirty = true;
+        } else if (step->type == MAPPER_MACRO_STEP_MOUSE_MODE_TOGGLE_KEY) {
+            g_mouse_mode_secondary = !g_mouse_mode_secondary;
+            mouse_mode_changed();
+            if (step->key[0] != 0) {
+                g_macro_key_modifier = 0;
+                memset(g_macro_keycode, 0, sizeof(g_macro_keycode));
+                g_macro_keycode[0] = step->key[0];
+                g_macro_keyboard_dirty = true;
+            }
+        } else if (step->type == MAPPER_MACRO_STEP_MOUSE_MODE_SWAP) {
+            g_mouse_modes_swapped = !g_mouse_modes_swapped;
+            mouse_mode_changed();
         }
 
         uint32_t duration_ms = step->duration_ms;
@@ -412,6 +505,9 @@ static void macro_step_delivered(uint64_t now_us) {
     if (!g_macro_active || g_macro_step_duration_us == 0) return;
     g_macro_next_step_us = now_us + g_macro_step_duration_us;
     g_macro_step_duration_us = 0;
+    if (g_macro_wheel_direction != 0) {
+        g_macro_wheel_next_us = now_us + g_macro_wheel_interval_us;
+    }
 }
 
 static void out_add_wheel(action_runtime_t *runtime, uint8_t action_type,
@@ -457,14 +553,18 @@ static void clear_toggle_latches_except(action_runtime_t *keep) {
     }
 }
 
-static void macro_touch_edge(uint8_t index, action_runtime_t *runtime,
+static void macro_touch_edge(const mapper_action_t *action, action_runtime_t *runtime,
                              bool active, bool was_active,
                              uint64_t now_us) {
+    uint8_t index = action->param1;
     if (index >= MAPPER_MACRO_MAX) return;
 
     const mapper_macro_t *macro = &mapper_config_get()->macros[index];
+    runtime->macro_trigger_mode = (action->trigger_mode & MAPPER_MACRO_TRIGGER_OVERRIDE)
+        ? (action->trigger_mode & 0x03u) : macro->trigger_mode;
+    if (macro->step_count == 0) return;
     if (active && !was_active) {
-        if (macro->trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE) {
+        if (runtime->macro_trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE) {
             if (runtime->macro_toggle_latched) {
                 runtime->macro_toggle_latched = false;
                 if (g_macro_active && g_macro_origin_runtime == runtime) {
@@ -475,13 +575,138 @@ static void macro_touch_edge(uint8_t index, action_runtime_t *runtime,
                 runtime->macro_toggle_latched = true;
                 macro_start(index, runtime, now_us, false);
             }
-        } else if (macro->trigger_mode != MAPPER_MACRO_TRIGGER_RELEASE) {
+        } else if (runtime->macro_trigger_mode != MAPPER_MACRO_TRIGGER_RELEASE) {
             macro_start(index, runtime, now_us, false);
         }
     } else if (!active && was_active) {
-        if (macro->trigger_mode == MAPPER_MACRO_TRIGGER_RELEASE) {
+        if (runtime->macro_trigger_mode == MAPPER_MACRO_TRIGGER_RELEASE) {
             macro_start(index, runtime, now_us, false);
+        } else if (runtime->macro_trigger_mode == MAPPER_MACRO_TRIGGER_WHILE_HELD &&
+                   g_macro_active && g_macro_origin_runtime == runtime) {
+            macro_stop(true);
         }
+    }
+}
+
+static action_runtime_t *action_slot(uint16_t slot, const mapper_action_t **action) {
+    const mapper_config_payload_t *config = mapper_config_get();
+    uint16_t direct_count = MAPPER_SOURCE_COUNT * MAPPER_GESTURE_COUNT;
+    if (slot < direct_count) {
+        uint8_t source = slot / MAPPER_GESTURE_COUNT;
+        uint8_t gesture = slot % MAPPER_GESTURE_COUNT;
+        *action = &config->bindings[config->settings.active_profile][source][gesture];
+        return &g_binding_runtimes[source][gesture];
+    }
+    slot -= direct_count;
+    *action = &config->combos[slot].action;
+    return &g_combo_runtimes[slot];
+}
+
+static uint8_t action_input_mode(const mapper_action_t *action) {
+    return ((uint16_t)action->value & 0xc000u) == MAPPER_ACTION_INPUT_TAG
+        ? ((uint16_t)action->value & MAPPER_ACTION_INPUT_MASK) : MAPPER_INPUT_WHILE_ACTIVE;
+}
+
+static uint32_t action_click_duration(const mapper_action_t *action) {
+    uint32_t duration_ms = ((uint16_t)action->value & 0xc000u) == MAPPER_ACTION_INPUT_TAG
+        ? (((uint16_t)action->value & 0x3ffcu) >> 2) : 0;
+    return (duration_ms != 0 ? duration_ms : mapper_config_get()->settings.tap_duration_ms) * 1000u;
+}
+
+static bool is_latched_output(const mapper_action_t *action) {
+    return action->type != MAPPER_ACTION_MACRO &&
+        (action->trigger_mode == MAPPER_ACTION_MODE_TOGGLE || action->trigger_mode == MAPPER_ACTION_MODE_PRESS);
+}
+
+static bool same_output(const mapper_action_t *a, const mapper_action_t *b) {
+    if (a->type != b->type || a->param1 != b->param1) return false;
+    return (a->type != MAPPER_ACTION_TWO_KEYS && a->type != MAPPER_ACTION_MODIFIER_KEY) || a->param2 == b->param2;
+}
+
+static bool report_has_key(const uint8_t keys[6], uint8_t key) {
+    if (key == 0) return true;
+    for (uint8_t i = 0; i < 6; i++) if (keys[i] == key) return true;
+    return false;
+}
+
+/* A Click's hold timer starts only once its press reached the HID endpoint.
+ * Endpoint backpressure or macro keyboard ownership cannot lose the click. */
+static void acknowledge_clicks(uint64_t now_us, const uint8_t keys[6], uint8_t modifier, uint8_t buttons) {
+    if (!g_click_needs_ack) return;
+    bool waiting = false;
+    for (uint16_t slot = 0; slot < ACTION_RUNTIME_COUNT; slot++) {
+        const mapper_action_t *action;
+        action_runtime_t *runtime = action_slot(slot, &action);
+        if (!runtime->click_pending && !runtime->click_release_pending) continue;
+        bool delivered = false;
+        if (keys != NULL) {
+            if (action->type == MAPPER_ACTION_KEY) delivered = runtime->click_pending
+                ? report_has_key(keys, action->param1) : (action->param1 == 0 || !report_has_key(keys, action->param1));
+            if (action->type == MAPPER_ACTION_TWO_KEYS) delivered = runtime->click_pending
+                ? report_has_key(keys, action->param1) && report_has_key(keys, action->param2)
+                : (action->param1 == 0 || !report_has_key(keys, action->param1)) && (action->param2 == 0 || !report_has_key(keys, action->param2));
+            if (action->type == MAPPER_ACTION_MODIFIER_KEY) delivered = runtime->click_pending
+                ? (modifier & action->param1) == action->param1 && report_has_key(keys, action->param2)
+                : (modifier & action->param1) == 0 && (action->param2 == 0 || !report_has_key(keys, action->param2));
+        } else if (action->type == MAPPER_ACTION_MOUSE_BUTTON) {
+            delivered = runtime->click_pending ? (buttons & action->param1) == action->param1 : (buttons & action->param1) == 0;
+        }
+        if (delivered) {
+            if (runtime->click_pending) {
+                runtime->click_pending = false;
+                runtime->click_until_us = now_us + runtime->click_duration_us;
+            } else {
+                runtime->click_release_pending = false;
+            }
+        }
+        waiting |= runtime->click_pending || runtime->click_release_pending;
+    }
+    g_click_needs_ack = waiting;
+}
+
+static void resolve_latched_outputs(uint64_t now_us, keyboard_builder_t *keyboard) {
+    if (g_latched_count == 0 && !g_release_latch_requested) return;
+    /* Release actions clear matching latches before any of them are emitted,
+     * regardless of combo priority / binding iteration order. */
+    for (uint16_t slot = 0; g_release_latch_requested && slot < ACTION_RUNTIME_COUNT; slot++) {
+        const mapper_action_t *release_action;
+        action_runtime_t *release = action_slot(slot, &release_action);
+        if (!release->release_requested) continue;
+        release->release_requested = false;
+        for (uint8_t target = 0; target < g_latched_count; target++) {
+            const mapper_action_t *target_action = g_latched_actions[target];
+            action_runtime_t *runtime = g_latched_runtimes[target];
+            if (!same_output(release_action, target_action)) continue;
+            runtime->toggle_latched = false;
+            runtime->output_active = false;
+            runtime->wheel_next_us = 0;
+            if (target_action->type == MAPPER_ACTION_MOUSE_BUTTON) g_mouse_forced_release_mask |= target_action->param1;
+        }
+    }
+    g_release_latch_requested = false;
+    for (uint8_t slot = 0; slot < g_latched_count;) {
+        const mapper_action_t *action = g_latched_actions[slot];
+        action_runtime_t *runtime = g_latched_runtimes[slot];
+        runtime->output_active = runtime->toggle_latched;
+        if (!runtime->output_active) {
+            runtime->latch_registered = false;
+            --g_latched_count;
+            g_latched_actions[slot] = g_latched_actions[g_latched_count];
+            g_latched_runtimes[slot] = g_latched_runtimes[g_latched_count];
+            continue;
+        }
+        switch (action->type) {
+            case MAPPER_ACTION_KEY: builder_add_keycode(keyboard, action->param1); break;
+            case MAPPER_ACTION_TWO_KEYS:
+                builder_add_keycode(keyboard, action->param1);
+                builder_add_keycode(keyboard, action->param2); break;
+            case MAPPER_ACTION_MODIFIER_KEY:
+                keyboard->modifier |= action->param1;
+                builder_add_keycode(keyboard, action->param2); break;
+            case MAPPER_ACTION_MOUSE_BUTTON: g_mouse_buttons_builder |= action->param1; break;
+            default: out_add_wheel(runtime, action->type, true, now_us); break;
+        }
+        ++slot;
     }
 }
 
@@ -490,36 +715,107 @@ static void apply_action(const mapper_action_t *action,
                          uint64_t now_us,
                          keyboard_builder_t *keyboard) {
     bool was_active = runtime->active;
+    bool was_output_active = runtime->output_active;
+    bool input_was_active = runtime->input_active;
+    uint8_t input_mode = action_input_mode(action);
+    if (active && !input_was_active) runtime->input_start_us = now_us;
+    runtime->input_active = active;
+    if (input_mode == MAPPER_INPUT_PRESSED) active = active && !input_was_active;
+    else if (input_mode == MAPPER_INPUT_RELEASED) active = !active && input_was_active;
+    else if (input_mode == MAPPER_INPUT_CLICK) active = !active && input_was_active &&
+        now_us - runtime->input_start_us < (uint64_t)mapper_config_get()->settings.hold_threshold_ms * 1000u;
+    bool output_active = active;
+    bool deferred = is_latched_output(action);
+    if (deferred) {
+        if (active && !was_active) runtime->toggle_latched = action->trigger_mode == MAPPER_ACTION_MODE_PRESS
+            ? true : !runtime->toggle_latched;
+        output_active = runtime->toggle_latched;
+        if (output_active && !runtime->latch_registered && g_latched_count < ACTION_RUNTIME_COUNT) {
+            g_latched_runtimes[g_latched_count] = runtime;
+            g_latched_actions[g_latched_count++] = action;
+            runtime->latch_registered = true;
+        }
+    } else if (action->type != MAPPER_ACTION_MACRO && action->trigger_mode == MAPPER_ACTION_MODE_RELEASE) {
+        if (active && !was_active) {
+            runtime->release_requested = true;
+            g_release_latch_requested = true;
+        }
+        output_active = false;
+    } else if ((action->type >= MAPPER_ACTION_KEY && action->type <= MAPPER_ACTION_WHEEL_DOWN_COMBO) ||
+               action->type == MAPPER_ACTION_TWO_KEYS) {
+        if (action->trigger_mode == MAPPER_ACTION_MODE_CLICK || input_mode != MAPPER_INPUT_WHILE_ACTIVE) {
+            bool wheel = action->type >= MAPPER_ACTION_WHEEL_UP_TURBO && action->type <= MAPPER_ACTION_WHEEL_DOWN_COMBO;
+            if (!wheel && runtime->click_until_us != 0 && now_us >= runtime->click_until_us) {
+                runtime->click_until_us = 0;
+                runtime->click_release_pending = true;
+                g_click_needs_ack = true;
+            }
+            if (!wheel && active && !was_active && runtime->click_queue < GESTURE_PULSE_QUEUE_LEN) runtime->click_queue++;
+            if (!wheel && runtime->click_queue != 0 && !runtime->click_pending &&
+                !runtime->click_release_pending && runtime->click_until_us == 0) {
+                runtime->click_queue--;
+                runtime->click_pending = true;
+                runtime->click_until_us = 0;
+                runtime->click_duration_us = action_click_duration(action);
+                g_click_needs_ack = true;
+            }
+            output_active = wheel ? (active && !was_active)
+                : (runtime->click_pending || now_us < runtime->click_until_us);
+        }
+    }
+    runtime->output_active = output_active;
+    if (action->type == MAPPER_ACTION_MOUSE_BUTTON &&
+        (action->trigger_mode & MAPPER_MACRO_TRIGGER_OVERRIDE || input_mode != MAPPER_INPUT_WHILE_ACTIVE) &&
+        was_output_active && !output_active) {
+        g_mouse_forced_release_mask |= action->param1;
+    }
+    /* Toggle/Press outputs are merged after all Release actions are known. */
+    if (deferred) {
+        if (!runtime->output_active) runtime->wheel_next_us = 0;
+        runtime->active = active;
+        return;
+    }
 
     switch (action->type) {
         case MAPPER_ACTION_NONE:
             break;
 
         case MAPPER_ACTION_KEY:
-            if (active) builder_add_keycode(keyboard, action->param1);
+            if (output_active) builder_add_keycode(keyboard, action->param1);
+            break;
+
+        case MAPPER_ACTION_TWO_KEYS:
+            if (output_active) {
+                builder_add_keycode(keyboard, action->param1);
+                builder_add_keycode(keyboard, action->param2);
+            }
             break;
 
         case MAPPER_ACTION_MODIFIER_KEY:
-            if (active) {
+            if (output_active) {
                 keyboard->modifier |= action->param1;
                 builder_add_keycode(keyboard, action->param2);
             }
             break;
 
         case MAPPER_ACTION_MOUSE_BUTTON:
-            if (active) g_mouse_buttons_builder |= action->param1;
+            if (output_active) g_mouse_buttons_builder |= action->param1;
             break;
 
         case MAPPER_ACTION_WHEEL_UP_TURBO:
         case MAPPER_ACTION_WHEEL_DOWN_TURBO:
         case MAPPER_ACTION_WHEEL_UP_COMBO:
         case MAPPER_ACTION_WHEEL_DOWN_COMBO:
-            out_add_wheel(runtime, action->type, active, now_us);
+            out_add_wheel(runtime, action->type, output_active, now_us);
             break;
 
         case MAPPER_ACTION_MACRO:
-            macro_touch_edge(action->param1, runtime, active, was_active,
+            macro_touch_edge(action, runtime, active, was_active,
                              now_us);
+            break;
+
+        case MAPPER_ACTION_STOP_ALL:
+            if (active && !was_active) g_stop_all_requested = true;
             break;
 
         case MAPPER_ACTION_ALT_TAP_KEY:
@@ -545,6 +841,23 @@ static void apply_action(const mapper_action_t *action,
             }
             break;
 
+        case MAPPER_ACTION_MOUSE_MODE_TOGGLE_KEY:
+            if (active && !was_active) {
+                g_mouse_mode_secondary = !g_mouse_mode_secondary;
+                mouse_mode_changed();
+            }
+            if (active) {
+                builder_add_keycode(keyboard, action->param1);
+            }
+            break;
+
+        case MAPPER_ACTION_MOUSE_MODE_SWAP:
+            if (active && !was_active) {
+                g_mouse_modes_swapped = !g_mouse_modes_swapped;
+                mouse_mode_changed();
+            }
+            break;
+
         default:
             break;
     }
@@ -552,7 +865,36 @@ static void apply_action(const mapper_action_t *action,
     runtime->active = active;
 }
 
+static void apply_combo_action(const mapper_action_t *action,
+                               action_runtime_t *runtime, bool matched,
+                               uint64_t now_us,
+                               keyboard_builder_t *keyboard) {
+    if (!matched) {
+        runtime->combo_delay_start_us = 0;
+        apply_action(action, runtime, false, now_us, keyboard);
+        return;
+    }
+
+    if (action->duration_ms == 0) {
+        apply_action(action, runtime, true, now_us, keyboard);
+        return;
+    }
+
+    if (runtime->combo_delay_start_us == 0) {
+        runtime->combo_delay_start_us = now_us;
+    }
+    bool delay_elapsed =
+        now_us - runtime->combo_delay_start_us >=
+        (uint64_t)action->duration_ms * 1000u;
+    apply_action(action, runtime, delay_elapsed, now_us, keyboard);
+}
+
 static void cancel_action_runtime(action_runtime_t *runtime) {
+    if (g_macro_active && g_macro_origin_runtime == runtime &&
+        (runtime->macro_trigger_mode == MAPPER_MACRO_TRIGGER_WHILE_HELD ||
+         runtime->macro_trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE)) {
+        macro_stop(true);
+    }
     if (runtime->macro_toggle_latched) {
         runtime->macro_toggle_latched = false;
         if (g_macro_active && g_macro_origin_runtime == runtime) {
@@ -560,8 +902,18 @@ static void cancel_action_runtime(action_runtime_t *runtime) {
         }
     }
     runtime->active = false;
+    runtime->input_active = false;
+    runtime->input_start_us = 0;
+    runtime->click_pending = false;
+    runtime->click_release_pending = false;
+    runtime->click_queue = 0;
+    runtime->click_until_us = 0;
+    runtime->release_requested = false;
+    runtime->output_active = false;
+    runtime->toggle_latched = false;
     runtime->alt_pending_key = 0;
     runtime->wheel_next_us = 0;
+    runtime->combo_delay_start_us = 0;
 }
 
 static void cancel_source_state(mapper_source_t source) {
@@ -575,6 +927,12 @@ static bool source_requires_release_latch(mapper_source_t source) {
     const mapper_config_payload_t *config = mapper_config_get();
     uint8_t profile = config->settings.active_profile;
     const mapper_action_t *binding = config->bindings[profile][source];
+    for (uint8_t gesture = 0; gesture < MAPPER_GESTURE_COUNT; gesture++) {
+        if (binding[gesture].trigger_mode & MAPPER_MACRO_TRIGGER_OVERRIDE ||
+            action_input_mode(&binding[gesture]) != MAPPER_INPUT_WHILE_ACTIVE) return true;
+        if (binding[gesture].type == MAPPER_ACTION_MACRO &&
+            config->macros[binding[gesture].param1].trigger_mode == MAPPER_MACRO_TRIGGER_TOGGLE) return true;
+    }
     return binding[MAPPER_GESTURE_TAP].type != MAPPER_ACTION_NONE ||
            binding[MAPPER_GESTURE_DOUBLE].type != MAPPER_ACTION_NONE;
 }
@@ -594,7 +952,7 @@ static uint8_t active_source_mouse_buttons(uint8_t profile,
     uint8_t buttons = 0;
 
     for (uint8_t gesture = 0; gesture < MAPPER_GESTURE_COUNT; gesture++) {
-        if (g_binding_runtimes[source][gesture].active) {
+        if (g_binding_runtimes[source][gesture].output_active) {
             buttons |= action_mouse_buttons(
                 &config->bindings[profile][source][gesture]);
         }
@@ -776,6 +1134,7 @@ uint8_t mapper_action_build_keycodes(uint8_t keycode[6], uint64_t now_us) {
     uint8_t profile = config->settings.active_profile;
 
     if (g_last_profile != profile) {
+        if (g_last_profile != 0xff) macro_stop(true);
         reset_source_states();
         g_last_profile = profile;
     }
@@ -796,26 +1155,33 @@ uint8_t mapper_action_build_keycodes(uint8_t keycode[6], uint64_t now_us) {
                        profile_enabled &&
                        mask_sources_pressed(combo->source_mask, &state);
 
+        if (g_combo_suppressed_until_release[i]) {
+            if (!matched) g_combo_suppressed_until_release[i] = false;
+            cancel_action_runtime(&g_combo_runtimes[i]);
+            continue;
+        }
+
         if (!matched) {
-            apply_action(&combo->action, &g_combo_runtimes[i], false,
-                         now_us, &keyboard);
+            apply_combo_action(&combo->action, &g_combo_runtimes[i], false,
+                               now_us, &keyboard);
             continue;
         }
 
         if ((combo->source_mask & claimed_sources) != 0) {
             /* A higher-priority overlapping combo owns these sources. */
-            if (g_combo_runtimes[i].active) {
+            if (g_combo_runtimes[i].output_active) {
                 g_mouse_forced_release_mask |=
                     action_mouse_buttons(&combo->action);
             }
             cancel_action_runtime(&g_combo_runtimes[i]);
+            g_combo_suppressed_until_release[i] = true;
             continue;
         }
 
         claimed_sources |= combo->source_mask;
         suppressed_sources |= combo->suppress_sources;
-        apply_action(&combo->action, &g_combo_runtimes[i], true,
-                     now_us, &keyboard);
+        apply_combo_action(&combo->action, &g_combo_runtimes[i], true,
+                           now_us, &keyboard);
     }
     g_suppressed_sources = suppressed_sources;
 
@@ -857,6 +1223,38 @@ uint8_t mapper_action_build_keycodes(uint8_t keycode[6], uint64_t now_us) {
         process_button_source(source, pressed, now_us, &keyboard);
     }
 
+    resolve_latched_outputs(now_us, &keyboard);
+
+    /* Resolve Stop after every action so array order cannot restart playback
+     * or leave an output latched in this tick. Held inputs must be released
+     * before they can trigger again. */
+    if (g_stop_all_requested) {
+        g_stop_all_requested = false;
+        macro_stop(true);
+        g_snapshot_active = false;
+        for (uint8_t source = 0; source < MAPPER_SOURCE_COUNT; source++) {
+            g_source_suppressed_until_release[source] =
+                source_is_pressed((mapper_source_t)source, &state);
+            cancel_source_state((mapper_source_t)source);
+        }
+        for (uint8_t combo = 0; combo < MAPPER_COMBO_MAX; combo++) {
+            const mapper_combo_t *binding = &config->combos[combo];
+            g_combo_suppressed_until_release[combo] =
+                binding->action.type != MAPPER_ACTION_NONE &&
+                (binding->profile_mask & (1u << profile)) != 0 &&
+                mask_sources_pressed(binding->source_mask, &state);
+            cancel_action_runtime(&g_combo_runtimes[combo]);
+        }
+        for (uint8_t slot = 0; slot < g_latched_count; slot++) g_latched_runtimes[slot]->latch_registered = false;
+        g_latched_count = 0;
+        g_release_latch_requested = false;
+        memset(&keyboard, 0, sizeof(keyboard));
+        g_wheel_pending = 0;
+        g_mouse_buttons_builder = 0;
+        g_mouse_forced_release_mask = MAPPER_MOUSE_LEFT | MAPPER_MOUSE_RIGHT | MAPPER_MOUSE_MIDDLE;
+        reset_mouse_release_grace();
+    }
+
     if (g_snapshot_active) {
         uint64_t elapsed = now_us - g_snapshot_start_us;
         if (elapsed >= SNAPSHOT_TOTAL_US) {
@@ -871,21 +1269,17 @@ uint8_t mapper_action_build_keycodes(uint8_t keycode[6], uint64_t now_us) {
         }
     }
 
-    /* Action edges must keep running during playback so a held/toggle macro
-     * can observe release or the next press. Playback owns actual HID output. */
+    /* Keep held keys/modifiers alive during playback, just as the mouse path
+     * already merges live buttons with macro buttons. */
     macro_task(now_us);
     if (g_macro_active) {
-        g_wheel_pending = 0;
-        memcpy(keycode, g_macro_keycode, 6);
-        return g_macro_key_modifier;
-    }
-
-    if (g_macro_needs_neutral) {
-        memset(keycode, 0, 6);
-        return 0;
+        keyboard.modifier |= g_macro_key_modifier;
+        for (uint8_t i = 0; i < 6; i++) builder_add_keycode(&keyboard, g_macro_keycode[i]);
     }
 
     memcpy(keycode, keyboard.keycode, 6);
+    g_expected_keyboard_modifier = keyboard.modifier;
+    memcpy(g_expected_keyboard_keys, keycode, 6);
     return keyboard.modifier;
 }
 
@@ -931,6 +1325,7 @@ static bool mouse_report_send(uint64_t now_us, uint8_t buttons, int8_t dx,
     g_last_mouse_dy = dy;
     g_last_mouse_wheel = wheel;
     g_last_mouse_report_us = now_us;
+    acknowledge_clicks(now_us, NULL, 0, buttons);
     trace_action_mouse_output(
         source, now_us, previous_buttons, buttons);
     return true;
@@ -946,17 +1341,17 @@ static void macro_finish_neutral_if_complete(void) {
 void mapper_action_note_keyboard_state(uint64_t now_us, uint8_t modifier,
                                        const uint8_t keycode[6]) {
     if (keycode == NULL) return;
+    acknowledge_clicks(now_us, keycode, modifier, 0);
 
     if (g_macro_active && g_macro_keyboard_dirty &&
-        modifier == g_macro_key_modifier &&
-        memcmp(keycode, g_macro_keycode, sizeof(g_macro_keycode)) == 0) {
+        modifier == g_expected_keyboard_modifier &&
+        memcmp(keycode, g_expected_keyboard_keys, sizeof(g_expected_keyboard_keys)) == 0) {
         g_macro_keyboard_dirty = false;
         macro_step_delivered(now_us);
     }
 
-    if (g_macro_needs_neutral && modifier == 0) {
-        static const uint8_t neutral[6] = {0, 0, 0, 0, 0, 0};
-        if (memcmp(keycode, neutral, sizeof(neutral)) == 0) {
+    if (g_macro_needs_neutral && modifier == g_expected_keyboard_modifier) {
+        if (memcmp(keycode, g_expected_keyboard_keys, sizeof(g_expected_keyboard_keys)) == 0) {
             g_macro_keyboard_neutral_done = true;
             macro_finish_neutral_if_complete();
         }
@@ -964,13 +1359,24 @@ void mapper_action_note_keyboard_state(uint64_t now_us, uint8_t modifier,
 }
 
 bool mapper_action_send_mouse(uint64_t now_us) {
+    /* An unchanged report already delivered this state; no new send is needed. */
+    acknowledge_clicks(now_us, NULL, 0, g_last_mouse_buttons);
     uint8_t live_mouse_buttons =
         live_mouse_buttons_with_release_grace(now_us);
 
     if (g_macro_active) {
+        if (!g_macro_mouse_dirty && g_macro_wheel_direction != 0 &&
+            g_macro_next_step_us != 0 && now_us < g_macro_next_step_us &&
+            now_us >= g_macro_wheel_next_us) {
+            g_macro_mouse_wheel = g_macro_wheel_direction;
+            g_macro_mouse_dirty = true;
+        }
         bool has_relative = g_macro_mouse_dx != 0 ||
                             g_macro_mouse_dy != 0 ||
-                            g_macro_mouse_wheel != 0;
+                            g_macro_mouse_wheel != 0 || g_wheel_pending != 0;
+        int16_t live_wheel = (int16_t)clamp_int32(g_wheel_pending,
+            -128 - g_macro_mouse_wheel, 127 - g_macro_mouse_wheel);
+        int8_t combined_wheel = (int8_t)(g_macro_mouse_wheel + live_wheel);
         uint8_t macro_mouse_buttons =
             (uint8_t)(live_mouse_buttons | g_macro_mouse_buttons);
         if (g_macro_mouse_dirty) {
@@ -983,9 +1389,10 @@ bool mapper_action_send_mouse(uint64_t now_us) {
 
             bool queued = mouse_report_send(
                 now_us, macro_mouse_buttons, g_macro_mouse_dx,
-                g_macro_mouse_dy, g_macro_mouse_wheel, has_relative,
+                g_macro_mouse_dy, combined_wheel, has_relative,
                 "macro");
             if (!queued) return false;
+            g_wheel_pending -= live_wheel;
 
             /* Relative axes and wheel are one-shot events. Keep them dirty
              * until the endpoint accepts the report, then consume exactly once. */
@@ -994,11 +1401,16 @@ bool mapper_action_send_mouse(uint64_t now_us) {
             g_macro_mouse_wheel = 0;
             g_macro_mouse_dirty = false;
             macro_step_delivered(now_us);
+            if (g_macro_wheel_direction != 0) {
+                g_macro_wheel_next_us = now_us + g_macro_wheel_interval_us;
+            }
             return true;
         }
 
-        return mouse_report_send(now_us, macro_mouse_buttons, 0, 0, 0,
-                                 false, "macro_hold");
+        bool queued = mouse_report_send(now_us, macro_mouse_buttons, 0, 0,
+                                        (int8_t)live_wheel, live_wheel != 0, "macro_hold");
+        if (queued) g_wheel_pending -= live_wheel;
+        return queued;
     }
 
     if (g_macro_needs_neutral) {
@@ -1032,12 +1444,15 @@ bool mapper_action_send_mouse(uint64_t now_us) {
         (1u << MAPPER_SRC_RSTICK_RIGHT);
     bool suppress_movement = g_calibration_active ||
                              (g_suppressed_sources & right_stick_sources) != 0;
+    uint8_t mouse_mode = active_mouse_mode();
+    float mouse_mode_deadzone =
+        mapper_config_mouse_mode_deadzone(config, mouse_mode);
     float rx = suppress_movement
                    ? 0.0f
-                   : apply_deadzone(state.rx, config->settings.right_deadzone);
+                   : apply_deadzone(state.rx, mouse_mode_deadzone);
     float ry = suppress_movement
                    ? 0.0f
-                   : apply_deadzone(state.ry, config->settings.right_deadzone);
+                   : apply_deadzone(state.ry, mouse_mode_deadzone);
     if (suppress_movement) {
         g_mouse_accum_x = 0.0f;
         g_mouse_accum_y = 0.0f;
@@ -1053,24 +1468,25 @@ bool mapper_action_send_mouse(uint64_t now_us) {
             config->settings.profile2_accel_enabled != 0u : true;
         float outer_threshold = advanced ?
             (float)config->settings.profile2_outer_threshold_percent / 100.0f : 0.95f;
-        uint16_t rb_speed_x = advanced ? config->profile2_stick.rb_speed_x : 3750u;
-        uint16_t rb_speed_y = advanced ? config->profile2_stick.rb_speed_y : 2000u;
-        bool rb_held = (state.buttons & MBTN_RB) != 0;
-        if (rb_held) {
-            speed_x = (float)rb_speed_x;
-            speed_y = (float)rb_speed_y;
+        uint16_t ads_speed_x = advanced ? config->profile2_stick.rb_speed_x : 3750u;
+        uint16_t ads_speed_y = advanced ? config->profile2_stick.rb_speed_y : 2000u;
+        bool aim_held = source_is_pressed(
+            mapper_config_profile2_aim_source(config), &state);
+        if (aim_held) {
+            speed_x = (float)ads_speed_x;
+            speed_y = (float)ads_speed_y;
         }
 
         float stick_mag = sqrtf(rx * rx + ry * ry);
         if (accel_enabled && stick_mag >= outer_threshold) {
-            if (!g_profile2_outer_active || g_profile2_outer_rb != rb_held) {
+            if (!g_profile2_outer_active || g_profile2_outer_aim != aim_held) {
                 g_profile2_outer_active = true;
-                g_profile2_outer_rb = rb_held;
+                g_profile2_outer_aim = aim_held;
                 g_profile2_outer_start_us = now_us;
             }
 
             uint64_t outer_us = now_us - g_profile2_outer_start_us;
-            if (rb_held) {
+            if (aim_held) {
                 uint64_t delay_us = advanced ?
                     (uint64_t)config->profile2_stick.rb_delay_ms * 1000u : 250000u;
                 uint64_t ramp_us = advanced ?
@@ -1096,12 +1512,12 @@ bool mapper_action_send_mouse(uint64_t now_us) {
             }
         } else {
             g_profile2_outer_active = false;
-            g_profile2_outer_rb = false;
+            g_profile2_outer_aim = false;
             g_profile2_outer_start_us = 0;
         }
     } else {
         g_profile2_outer_active = false;
-        g_profile2_outer_rb = false;
+        g_profile2_outer_aim = false;
         g_profile2_outer_start_us = 0;
     }
 
@@ -1112,6 +1528,10 @@ bool mapper_action_send_mouse(uint64_t now_us) {
                       (float)MAPPER_VIRTUAL_DPI_DEFAULT;
     speed_x *= dpi_scale;
     speed_y *= dpi_scale;
+    float mouse_mode_scale =
+        (float)mapper_config_mouse_mode_sensitivity(config, mouse_mode) / 100.0f;
+    speed_x *= mouse_mode_scale;
+    speed_y *= mouse_mode_scale;
 
     float dt = 0.000125f; /* 8 kHz nominal output rate */
     if (g_last_mouse_report_us != 0 && now_us > g_last_mouse_report_us) {
@@ -1153,6 +1573,7 @@ bool mapper_action_send_mouse(uint64_t now_us) {
     g_last_mouse_dy = (int8_t)move_y;
     g_last_mouse_wheel = (int8_t)wheel;
     g_wheel_pending -= (int16_t)wheel;
+    acknowledge_clicks(now_us, NULL, 0, buttons);
     trace_action_mouse_output(
         "normal", now_us, previous_buttons, buttons);
     return true;
@@ -1179,7 +1600,7 @@ bool mapper_action_send_neutral_step(uint64_t now_us, bool keyboard_neutral) {
     g_mouse_buttons_builder = 0;
     reset_mouse_release_grace();
     g_profile2_outer_active = false;
-    g_profile2_outer_rb = false;
+    g_profile2_outer_aim = false;
     g_profile2_outer_start_us = 0;
 
 
@@ -1216,13 +1637,14 @@ bool mapper_action_release_pending(void) {
 void mapper_action_reset(void) {
     macro_stop(false);
     reset_source_states();
+    g_macro_alt_next_key = HID_KEY_1;
     g_mouse_buttons_builder = 0;
     g_wheel_pending = 0;
     g_mouse_accum_x = 0.0f;
     g_mouse_accum_y = 0.0f;
     reset_mouse_release_grace();
     g_profile2_outer_active = false;
-    g_profile2_outer_rb = false;
+    g_profile2_outer_aim = false;
     g_profile2_outer_start_us = 0;
 
     g_neutral_pending = true;
@@ -1251,6 +1673,7 @@ void mapper_action_set_calibration(uint16_t rx_center, uint16_t ry_center,
     config->settings.right_center_x = rx_center;
     config->settings.right_center_y = ry_center;
     config->settings.right_deadzone = right_deadzone;
+    mapper_config_set_mouse_mode_deadzone(config, 0u, right_deadzone);
     mapper_parser_set_calibration(rx_center, ry_center, right_deadzone);
     mapper_action_reset();
 }
@@ -1260,7 +1683,7 @@ void mapper_action_set_calibration_active(bool active) {
     g_mouse_accum_x = 0.0f;
     g_mouse_accum_y = 0.0f;
     g_profile2_outer_active = false;
-    g_profile2_outer_rb = false;
+    g_profile2_outer_aim = false;
     g_profile2_outer_start_us = 0;
     if (active) g_last_mouse_report_us = 0;
 }
@@ -1272,6 +1695,7 @@ void mapper_action_init(void) {
                                   mapper_config_get()->settings.right_deadzone);
     reset_source_states();
     macro_stop(false);
+    g_last_profile = 0xff;
     g_calibration_active = false;
     g_neutral_pending = false;
 }

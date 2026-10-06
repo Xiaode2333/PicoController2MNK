@@ -1,7 +1,7 @@
 ; Inno Setup script for the PicoController2MNK Configurator.
 
 #define RootDir AddBackslash(SourcePath) + "..\.."
-#define AppVersion "0.1.2"
+#define AppVersion "0.2.4"
 
 [Setup]
 AppId={{8A7FCB95-6B9D-4A3B-8D6A-5CB8D8F52A71}
@@ -9,6 +9,8 @@ AppName=PicoController2MNK Configurator
 AppVersion={#AppVersion}
 AppPublisher=Xiaode2333
 DefaultDirName={localappdata}\Programs\PicoController2MNK
+UsePreviousAppDir=no
+DisableDirPage=no
 DefaultGroupName=PicoController2MNK
 OutputDir={#RootDir}\installer
 OutputBaseFilename=PicoController2MNK-Setup-{#AppVersion}
