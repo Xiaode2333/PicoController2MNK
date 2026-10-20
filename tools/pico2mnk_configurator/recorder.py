@@ -40,25 +40,40 @@ VK_TO_HID = {
     0x14: HID_NAME_TO_KEY["Caps Lock"],
     0x1B: HID_NAME_TO_KEY["Escape"],
     0x20: HID_NAME_TO_KEY["Space"],
-    0x21: 0x4B,  # PageUp
-    0x22: 0x4E,  # PageDown
-    0x23: 0x4D,  # End
-    0x24: 0x4A,  # Home
+    0x21: HID_NAME_TO_KEY["Page Up"],
+    0x22: HID_NAME_TO_KEY["Page Down"],
+    0x23: HID_NAME_TO_KEY["End"],
+    0x24: HID_NAME_TO_KEY["Home"],
     0x25: HID_NAME_TO_KEY["Left Arrow"],
     0x26: HID_NAME_TO_KEY["Up Arrow"],
     0x27: HID_NAME_TO_KEY["Right Arrow"],
     0x28: HID_NAME_TO_KEY["Down Arrow"],
-    0x2C: 0x46,  # PrintScreen
-    0x2D: 0x49,  # Insert
+    0x2C: HID_NAME_TO_KEY["Print Screen"],
+    0x2D: HID_NAME_TO_KEY["Insert"],
     0x2E: HID_NAME_TO_KEY["Delete"],
-    0x5B: 0xE3,  # Left GUI
-    0x5C: 0xE7,  # Right GUI
-    0x6A: 0x55,  # Numpad *
-    0x6B: 0x57,  # Numpad +
-    0x6D: 0x56,  # Numpad -
-    0x6E: 0x63,  # Numpad .
-    0x6F: 0x54,  # Numpad /
-    0x90: 0x53,  # NumLock
+    0x2F: HID_NAME_TO_KEY["Help"],
+    0x5D: HID_NAME_TO_KEY["Application"],
+    0x6A: HID_NAME_TO_KEY["Numpad *"],
+    0x6B: HID_NAME_TO_KEY["Numpad +"],
+    0x6C: HID_NAME_TO_KEY["Numpad Comma"],
+    0x6D: HID_NAME_TO_KEY["Numpad -"],
+    0x6E: HID_NAME_TO_KEY["Numpad ."],
+    0x6F: HID_NAME_TO_KEY["Numpad /"],
+    0x90: HID_NAME_TO_KEY["Num Lock"],
+    0x91: HID_NAME_TO_KEY["Scroll Lock"],
+    # Windows OEM virtual keys preserve the physical key when Shift is held.
+    0xBA: HID_NAME_TO_KEY[";"],
+    0xBB: HID_NAME_TO_KEY["="],
+    0xBC: HID_NAME_TO_KEY[","],
+    0xBD: HID_NAME_TO_KEY["-"],
+    0xBE: HID_NAME_TO_KEY["."],
+    0xBF: HID_NAME_TO_KEY["/"],
+    0xC0: HID_NAME_TO_KEY["`"],
+    0xDB: HID_NAME_TO_KEY["["],
+    0xDC: HID_NAME_TO_KEY["Backslash"],
+    0xDD: HID_NAME_TO_KEY["]"],
+    0xDE: HID_NAME_TO_KEY["'"],
+    0xE2: HID_NAME_TO_KEY["Non-US Backslash"],
 }
 
 VK_MODIFIERS = {
@@ -94,6 +109,26 @@ CHAR_TO_HID = {
 }
 
 
+KEY_NAME_TO_HID = {
+    name.lower().replace(" ", "_"): code for name, code in HID_NAME_TO_KEY.items()
+}
+KEY_NAME_TO_HID.update({
+    "esc": HID_NAME_TO_KEY["Escape"],
+    "left": HID_NAME_TO_KEY["Left Arrow"],
+    "right": HID_NAME_TO_KEY["Right Arrow"],
+    "up": HID_NAME_TO_KEY["Up Arrow"],
+    "down": HID_NAME_TO_KEY["Down Arrow"],
+    "menu": HID_NAME_TO_KEY["Application"],
+})
+KEY_NAME_TO_MODIFIER = {
+    "ctrl": MOD_LEFTCTRL, "ctrl_l": MOD_LEFTCTRL, "ctrl_r": MOD_RIGHTCTRL,
+    "shift": MOD_LEFTSHIFT, "shift_l": MOD_LEFTSHIFT, "shift_r": MOD_RIGHTSHIFT,
+    "alt": MOD_LEFTALT, "alt_l": MOD_LEFTALT, "alt_r": MOD_RIGHTALT,
+    "alt_gr": MOD_RIGHTALT,
+    "cmd": MOD_LEFTGUI, "cmd_l": MOD_LEFTGUI, "cmd_r": MOD_RIGHTGUI,
+}
+
+
 def is_stop_hotkey(key: Any) -> bool:
     """F12 is reserved for stopping capture and is never recorded."""
     try:
@@ -109,8 +144,16 @@ def is_stop_hotkey(key: Any) -> bool:
 
 def key_to_hid(key: Any) -> tuple[int, int]:
     """Return (hid_keycode_or_0, modifier_flags_or_0)."""
+    # pynput special keys are enums; their virtual key lives in .value.vk.
+    # Prefer names for these keys so other platform keycodes aren't read as VKs.
+    name = str(getattr(key, "name", "") or "").lower()
+    if name in KEY_NAME_TO_MODIFIER:
+        return 0, KEY_NAME_TO_MODIFIER[name]
+    if name in KEY_NAME_TO_HID:
+        return KEY_NAME_TO_HID[name], 0
+    keycode = getattr(key, "value", key)
     try:
-        vk = int(getattr(key, "vk", 0) or 0)
+        vk = int(getattr(keycode, "vk", 0) or 0)
     except Exception:
         vk = 0
 
@@ -123,9 +166,11 @@ def key_to_hid(key: Any) -> tuple[int, int]:
         if 0x41 <= vk <= 0x5A:
             return 0x04 + (vk - 0x41), 0
         if 0x60 <= vk <= 0x69:
-            return 0x59 + (vk - 0x60), 0  # numpad 0..9
+            return (0x62 if vk == 0x60 else 0x59 + (vk - 0x61)), 0
         if 0x70 <= vk <= 0x7B:
             return 0x3A + (vk - 0x70), 0  # F1..F12
+        if 0x7C <= vk <= 0x87:
+            return 0x68 + (vk - 0x7C), 0  # F13..F24
         mapped = VK_TO_HID.get(vk)
         if mapped is not None:
             return mapped, 0

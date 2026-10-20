@@ -267,7 +267,22 @@ static void test_keyboard_click_ack_and_combo_release_stop(void) {
     assert(wheels == 11); /* latched wheel continues throughout macro playback */
 }
 
+static void test_extended_keyboard_usages(void) {
+    for (unsigned code = 0x04; code <= 0xDD; code++) {
+        if (code >= 0xA5 && code < 0xB0) continue; /* reserved usages */
+        mapper_config_payload_t *cfg = prepare();
+        cfg->bindings[0][MAPPER_SRC_A][MAPPER_GESTURE_HOLD] =
+            (mapper_action_t){.type = MAPPER_ACTION_KEY, .param1 = code,
+                              .duration_ms = 1};
+        activate(8);
+        assert(keys[0] == code && modifier == 0);
+        tick(0, 1000);
+        assert(keys[0] == 0 && modifier == 0);
+    }
+}
+
 int main(int argc, char **argv) {
+    test_extended_keyboard_usages();
     test_outputs(); test_tap_hold_double_and_wheel(); test_combo_and_suppression();
     test_macros_and_stop(); test_reset_and_backpressure();
     test_held_alt_survives_macro(); test_events_clicks_and_explicit_release();

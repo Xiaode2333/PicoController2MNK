@@ -16,6 +16,58 @@ def key(*, vk=0, char="", name=""):
 
 
 class RecorderTests(unittest.TestCase):
+    def test_navigation_lock_and_application_virtual_keys(self):
+        for vk, name in {
+            0x21: "Page Up", 0x22: "Page Down", 0x23: "End", 0x24: "Home",
+            0x2C: "Print Screen", 0x2D: "Insert", 0x5D: "Application",
+            0x90: "Num Lock", 0x91: "Scroll Lock",
+        }.items():
+            with self.subTest(name=name):
+                self.assertEqual(key_to_hid(key(vk=vk)), (cm.HID_NAME_TO_KEY[name], 0))
+
+    def test_all_numpad_digits_and_function_keys(self):
+        for digit in range(10):
+            with self.subTest(digit=digit):
+                self.assertEqual(key_to_hid(key(vk=0x60 + digit)),
+                                 (cm.HID_NAME_TO_KEY[f"Numpad {digit}"], 0))
+        for number in range(1, 25):
+            with self.subTest(function=number):
+                self.assertEqual(key_to_hid(key(vk=0x6F + number)),
+                                 (cm.HID_NAME_TO_KEY[f"F{number}"], 0))
+
+    def test_pynput_special_key_enums_and_modifier_names(self):
+        for name, code in {"page_up": 0x4B, "page_down": 0x4E,
+                           "print_screen": 0x46, "enter": 0x28,
+                           "menu": 0x65, "f24": 0x73}.items():
+            with self.subTest(name=name):
+                self.assertEqual(key_to_hid(SimpleNamespace(
+                    name=name, value=key(vk=0))), (code, 0))
+        for name, modifier in {"ctrl_l": cm.MOD_LEFTCTRL,
+                               "shift_r": cm.MOD_RIGHTSHIFT,
+                               "alt_gr": cm.MOD_RIGHTALT,
+                               "cmd_r": cm.MOD_RIGHTGUI}.items():
+            with self.subTest(name=name):
+                self.assertEqual(key_to_hid(SimpleNamespace(
+                    name=name, value=key(vk=0))), (0, modifier))
+
+    def test_shifted_punctuation_keeps_underlying_key(self):
+        self.assertEqual(key_to_hid(key(vk=0xBB, char="+")), (0x2E, 0))
+        self.assertEqual(key_to_hid(key(vk=0xBA, char=":")), (0x33, 0))
+
+    def test_recorded_page_up_with_ctrl_releases_both(self):
+        recorder = Recorder()
+        ctrl = SimpleNamespace(name="ctrl_l", value=key(vk=0xA2))
+        page_up = SimpleNamespace(name="page_up", value=key(vk=0x21))
+        recorder.events = [RecordedEvent(0.00, "key_down", key=ctrl),
+                           RecordedEvent(0.01, "key_down", key=page_up),
+                           RecordedEvent(0.10, "key_up", key=page_up),
+                           RecordedEvent(0.11, "key_up", key=ctrl)]
+        steps = recorder.encode().steps
+        self.assertEqual(steps[1].modifier, cm.MOD_LEFTCTRL)
+        self.assertEqual(steps[1].keys, (0x4B, 0, 0, 0, 0, 0))
+        self.assertEqual(steps[2].keys, (0, 0, 0, 0, 0, 0))
+        self.assertEqual(steps[3].modifier, 0)
+
     def test_top_row_digit_hid_mapping(self):
         expected = {"0": 0x27, "1": 0x1E, "2": 0x1F, "9": 0x26}
         for digit, hid in expected.items():

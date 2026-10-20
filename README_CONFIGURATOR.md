@@ -86,6 +86,23 @@ is never flashed.
 
 ## Daily use
 
+- **Keyboard key choices**: every keyboard dropdown shares the complete assigned
+  USB HID Keyboard/Keypad catalogue: Page Up/Down, Home/End, Insert, Print Screen,
+  Scroll Lock, Num Lock, the numeric keypad, Application, F1-F24, international
+  and language keys, editing keys, and extended keypad keys. Bindings, combos,
+  modifier combinations, mouse-mode keys, and macro steps use the same choices.
+  Existing runtime-configurable firmware already transmits these usage codes;
+  no firmware update is required to use the expanded list. Ctrl/Shift/Alt/GUI
+  remain in the modifier controls (choose **Modifier + key**, leaving the key
+  empty for a modifier alone). Key names follow the
+  [USB HID Keyboard/Keypad usage page](https://www.usb.org/hid); international,
+  editing, and keyboard-page volume keys depend on OS/application support.
+  Consumer-page media playback, browser controls, and hardware-specific Fn keys
+  are outside this keyboard catalogue. The recorder now recognizes special-key
+  enums, F13-F24 and Num Lock/Scroll Lock, and correctly maps numpad 0-9.
+  The recording backend may report numpad Enter as ordinary Enter, or numpad
+  navigation as ordinary navigation when Num Lock is off; use the macro editor
+  to choose the exact keypad usage when needed.
 - **Bindings tab**: choose a Profile to see its complete direct bindings,
   stick/mouse rules, active combos, and all eight macros. Double-click any
   Tap/While pressed/Hold/Double cell, including stick-direction rows, to replace
